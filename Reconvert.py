@@ -4,8 +4,10 @@ import subprocess
 import sys
 import os
 import argparse
+import fcntl
 import re
 import unicodedata
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from datetime import datetime
 
@@ -17,9 +19,40 @@ ORIGINAL_BASES = [
 ]
 CONVERTED_BASE = Path("/mnt/converted_files").resolve()
 
+# TvRecorder.py の Config.lock_file と同じパスにすること。
+# 同じロックを取ることで、cron で動く TvRecorder.py との同時実行を防ぐ。
+# （同時に動くと、変換結果の削除と転送が競合したり、同じTSが二重に登録される）
+LOCK_FILE = Path("/tmp/TvRecorder.lock")
+
 DEFAULT_CLI_PATH = "/home/tv-recorder/Amatsukaze/Amatsukaze/exe_files/AmatsukazeAddTask"
 DEFAULT_SERVER_IP = "localhost"
 DEFAULT_PROFILE = "QsvEnc"
+
+
+@contextmanager
+def exclusive_lock(lock_path):
+    """TvRecorder.py と共有する排他ロックを取得する。
+
+    取得は「利用者の選択が終わってから」行うこと。選択待ちの間ロックを握って
+    いると、その間 cron の TvRecorder.py が何も処理できなくなる。
+    """
+    try:
+        lock_fd = open(lock_path, 'w')
+    except OSError as e:
+        print(f"[Error] ロックファイルを開けません ({lock_path}): {e}", file=sys.stderr)
+        print("        TvRecorder.py との競合を防げないため中止します。", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            print("TvRecorder.py が実行中です。終了を待機します... (Ctrl-C で中止)")
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            print("  -> ロックを取得しました。処理を開始します。")
+        yield
+    finally:
+        lock_fd.close()
 
 
 def get_candidate_files(base_dirs):
@@ -226,10 +259,18 @@ def main():
 
     mode_text = "【DryRun】" if DRY_RUN_MODE else "【実行】"
     print(f"\n--- {mode_text} 開始 ({len(selected_indices)}件) ---")
-    
-    for idx in selected_indices:
-        target_file = candidates[idx]["path"]
-        convert_single_file(target_file, DEFAULT_CLI_PATH, DEFAULT_SERVER_IP, DEFAULT_PROFILE)
+
+    # DryRun は何も変更しないため、ロック待ちで待たせない
+    lock = nullcontext() if DRY_RUN_MODE else exclusive_lock(LOCK_FILE)
+
+    try:
+        with lock:
+            for idx in selected_indices:
+                target_file = candidates[idx]["path"]
+                convert_single_file(target_file, DEFAULT_CLI_PATH, DEFAULT_SERVER_IP, DEFAULT_PROFILE)
+    except KeyboardInterrupt:
+        print("\n中止しました。")
+        sys.exit(130)
 
 if __name__ == "__main__":
     main()
