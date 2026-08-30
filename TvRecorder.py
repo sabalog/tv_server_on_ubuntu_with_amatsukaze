@@ -480,6 +480,12 @@ class Cleaner:
                 self.ops.delete_file(f.path)
 
     def delete_old_files_by_pattern(self, target_dir: Union[Path, str], days: int, pattern: str):
+        """target_dir 配下の古いファイルを、日数条件のみで無条件に削除する。
+
+        録画元のTSは通常 EPGStation が削除するため、ここでの削除は
+        「何らかの理由で削除されずに残り続けたファイルがディスクを圧迫するのを防ぐ」
+        ためのフェイルセーフ。バックアップ済みかどうかは判定しない。
+        """
         if not self.ops.exists(target_dir): return
         
         all_files = self.ops.list_files_recursive(target_dir)
