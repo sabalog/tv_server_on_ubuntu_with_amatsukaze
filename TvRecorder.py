@@ -386,14 +386,25 @@ class LocalDiskOperations(DiskOperations):
     def list_files_recursive(self, root_dir: Path, exclude_dirs: List[str] = None) -> Generator[FileEntry, None, None]:
         exclude_dirs = exclude_dirs or []
         excludes = [root_dir / d for d in exclude_dirs]
-        
+        self.listing_incomplete = False
+
         for p in root_dir.rglob('*'):
-            if p.is_file():
+            try:
+                if not p.is_file(): continue
                 if any(ex in p.parents for ex in excludes): continue
-                yield FileEntry(
-                    path=p, name=p.name, size=p.stat().st_size,
-                    mtime=datetime.fromtimestamp(p.stat().st_mtime)
-                )
+                st = p.stat()
+                entry = FileEntry(path=p, name=p.name, size=st.st_size,
+                                  mtime=datetime.fromtimestamp(st.st_mtime))
+            except FileNotFoundError:
+                # 走査中に録画ソフト等が削除した。一覧から漏れても実害はないので続行する
+                continue
+            except OSError as e:
+                # 権限エラー等は一覧が不完全になるため、容量判定に使わせない
+                self.listing_incomplete = True
+                logging.warning(f"  ファイル情報を取得できません: {p} ({e})")
+                continue
+
+            yield entry
 
     def delete_file(self, path: Path) -> bool:
         size_str = "Unknown"
@@ -769,15 +780,26 @@ class TsConverterPipeline(BasePipeline):
             
             try:
                 rel = p.relative_to(self.cfg.source_dir_ts)
-                if len(rel.parts) > 1 and rel.parts[0] in self.cfg.skip_folders_ts: continue
-            except ValueError: pass
-
-            if datetime.fromtimestamp(p.stat().st_mtime) >= threshold: continue
-
-            if self.state.is_recorded(StateManager.SECTION_CONVERT, p.name, p.stat().st_size):
+            except ValueError:
+                # 通常は起きないが、ここで握りつぶすと前のループの rel を流用して
+                # 誤った場所へ出力してしまうため、確実にスキップする
+                logging.warning(f"  相対パスを解決できないためスキップします: {p}")
                 continue
-                
-            yield {'src': p, 'rel': rel, 'size': p.stat().st_size}
+
+            if len(rel.parts) > 1 and rel.parts[0] in self.cfg.skip_folders_ts: continue
+
+            # 走査中に削除される可能性があるため、stat は1回だけ取って使い回す
+            try:
+                st = p.stat()
+            except OSError:
+                continue
+
+            if datetime.fromtimestamp(st.st_mtime) >= threshold: continue
+
+            if self.state.is_recorded(StateManager.SECTION_CONVERT, p.name, st.st_size):
+                continue
+
+            yield {'src': p, 'rel': rel, 'size': st.st_size}
 
     def _cleanup(self):
         self.cleaner.enforce_size_limit(self.cfg.converted_dir, self.cfg.max_size_converted_gb, self.cfg.converted_exclude_dirs)
@@ -869,22 +891,34 @@ class Mp4UploadPipeline(BasePipeline):
             # 実際にアップロードするタスクのみを抽出
             tasks_to_process = []
             for task in candidates:
+                if not self._connection_is_alive():
+                    logging.error("[NAS] 接続が切断されたため、転送要否の確認を中止します")
+                    break
                 if self._check_remote_status(task):
                     tasks_to_process.append(task)
-            
+
             # 本当に処理するタスクがある場合のみログを有効化・バナー出力
             if tasks_to_process:
                 self.cfg.write_log = True
                 activate_realtime_log()
                 logging.info("=== Phase 2: MP4転送 (Upload) ===")
-                
+
                 processed = 0
+                failed = 0
                 for task in tasks_to_process:
-                    self._process(task)
-                    processed += 1
-                
+                    # 切断後に残りのタスクを延々と失敗させ続けないよう、都度確認する
+                    if not self._connection_is_alive():
+                        logging.error(f"[NAS] 接続が切断されたため、残り{len(tasks_to_process) - processed - failed}件の転送を中止します")
+                        break
+                    if self._process(task):
+                        processed += 1
+                    else:
+                        failed += 1
+
                 if processed > 0:
                     logging.info(f"MP4転送完了数: {processed}")
+                if failed > 0:
+                    logging.warning(f"MP4転送失敗数: {failed}")
 
         finally:
             if self.transport: self.transport.close()
@@ -939,20 +973,33 @@ class Mp4UploadPipeline(BasePipeline):
             seen_names.add(p.name)
             
             if exclude_ptn.search(p.stem): continue
-            if datetime.fromtimestamp(p.stat().st_mtime) >= threshold: continue
 
-            size = p.stat().st_size
+            # 走査中に削除・入れ替えされる可能性があるため、stat は1回だけ取って使い回す
+            try:
+                st = p.stat()
+                rel = p.relative_to(self.cfg.converted_dir).as_posix()
+            except OSError:
+                continue
+            except ValueError:
+                logging.warning(f"  相対パスを解決できないためスキップします: {p}")
+                continue
+
+            if datetime.fromtimestamp(st.st_mtime) >= threshold: continue
+
+            size = st.st_size
             if self.state.is_recorded(StateManager.SECTION_UPLOAD_NAS, p.name, size): continue
 
-            rel = p.relative_to(self.cfg.converted_dir).as_posix()
             dest = posixpath.join(dest_root, rel)
-            
             yield {'src': p, 'dest': dest, 'name': p.name, 'size': size, 'type': 'mp4'}
 
             ass = p.with_suffix('.ass')
-            if ass.exists():
-                ass_dest = posixpath.join(dest_root, ass.relative_to(self.cfg.converted_dir).as_posix())
-                yield {'src': ass, 'dest': ass_dest, 'size': ass.stat().st_size, 'type': 'ass'}
+            try:
+                ass_size = ass.stat().st_size
+            except OSError:
+                continue   # 字幕が無い/読めない場合は本体のみ転送する
+
+            ass_dest = posixpath.join(dest_root, ass.relative_to(self.cfg.converted_dir).as_posix())
+            yield {'src': ass, 'dest': ass_dest, 'size': ass_size, 'type': 'ass'}
 
     def _check_remote_status(self, task) -> bool:
         try:
@@ -967,6 +1014,16 @@ class Mp4UploadPipeline(BasePipeline):
         except FileNotFoundError:
             task['reason'] = "新規"
             return True
+        except Exception as e:
+            # 接続断や権限エラーでフェーズごと落とさない。このファイルは次回に回す
+            logging.warning(f"[NAS] 転送要否を判定できません: {task['dest']} ({e})")
+            return False
+
+    def _connection_is_alive(self) -> bool:
+        try:
+            return bool(self.transport and self.transport.is_active())
+        except Exception:
+            return False
 
     def _cleanup(self):
         root = self.cfg.nas_config['dest_dir']
@@ -1000,12 +1057,15 @@ class Mp4UploadPipeline(BasePipeline):
             self.cfg.write_log = True
             activate_realtime_log()
 
-    def _process(self, task):
+    def _process(self, task) -> bool:
         dest_dir = posixpath.dirname(task['dest'])
         logging.info(f"[NAS] Upload ({task['reason']}): {task['src'].name} -> {dest_dir}")
-        if self._upload(task['src'], task['dest']):
-            if task['type'] == 'mp4':
-                self.state.update_entry(StateManager.SECTION_UPLOAD_NAS, task['name'], task['size'], self.cfg.dry_run)
+        if not self._upload(task['src'], task['dest']):
+            return False
+
+        if task['type'] == 'mp4':
+            self.state.update_entry(StateManager.SECTION_UPLOAD_NAS, task['name'], task['size'], self.cfg.dry_run)
+        return True
 
     def _upload(self, src, dest):
         if self.cfg.dry_run:
@@ -1093,19 +1153,31 @@ class TsBackupPipeline(BasePipeline):
             
             try:
                 rel = p.relative_to(self.cfg.source_dir_ts)
-                if len(rel.parts) > 1 and rel.parts[0] in self.cfg.skip_folders_ts: continue
-            except ValueError: pass
+            except ValueError:
+                # 前のループの rel を流用して誤った場所へコピーしないよう、確実にスキップする
+                logging.warning(f"  相対パスを解決できないためスキップします: {p}")
+                continue
 
-            if datetime.fromtimestamp(p.stat().st_mtime) >= threshold: continue
+            if len(rel.parts) > 1 and rel.parts[0] in self.cfg.skip_folders_ts: continue
 
-            size = p.stat().st_size
+            # 走査中に削除される可能性があるため、stat は1回だけ取って使い回す
+            try:
+                st = p.stat()
+            except OSError:
+                continue
+
+            if datetime.fromtimestamp(st.st_mtime) >= threshold: continue
+
+            size = st.st_size
             dest = self.cfg.dest_dir_hdd / rel
 
             if self.state.is_recorded(StateManager.SECTION_COPY_HDD, p.name, size):
                 continue
-            
-            if dest.exists() and dest.stat().st_size == size: continue
-            
+
+            try:
+                if dest.exists() and dest.stat().st_size == size: continue
+            except OSError: pass
+
             yield {'src': p, 'dest': dest, 'size': size, 'rel': rel}
 
     def _cleanup(self):
