@@ -30,7 +30,10 @@ TARGET_DIR="${HOME}/Amatsukaze/Amatsukaze"
 
 # バックアップファイルの保存先ディレクトリとファイル名
 BACKUP_DIR="${HOME}/Amatsukaze/Download"
-BACKUP_FILENAME="Amatsukaze_backup_$(date +%Y%m%d).tar.xz"
+# 同日に複数回実行しても上書きしないよう、時刻まで名前に含める。
+# （日付だけだと、更新に失敗して再実行した際に、直前の正常な状態のバックアップを
+#   「更新後の壊れた状態」で上書きしてしまう）
+BACKUP_FILENAME="Amatsukaze_backup_$(date +%Y%m%d_%H%M%S).tar.xz"
 
 # ダウンロードファイル名のプレフィックス（OS環境等に合わせて変更）
 FILE_PREFIX="Amatsukaze_Ubuntu24.04_"
@@ -121,6 +124,15 @@ if [ -d "$TARGET_DIR" ]; then
             mv -f "$BACKUP_TMP" "$BACKUP_FILE" \
                 || die "バックアップファイルを配置できません: ${BACKUP_FILE}"
             echo "バックアップが完了しました: ${BACKUP_FILE} ($(du -h "$BACKUP_FILE" | cut -f1))"
+
+            # 古いバックアップは自動削除しない（どれが必要かは利用者にしか分からない）。
+            # ただし溜まっていることに気付けるよう、件数と合計サイズを知らせる。
+            backup_count="$(find "$BACKUP_DIR_ABS" -maxdepth 1 -type f -name "Amatsukaze_backup_*.tar.xz" 2>/dev/null | wc -l | tr -d "[:space:]")"
+            if [ "${backup_count:-0}" -gt 1 ]; then
+                backup_total="$(du -ch "$BACKUP_DIR_ABS"/Amatsukaze_backup_*.tar.xz 2>/dev/null | tail -n 1 | cut -f1)"
+                echo "  -> バックアップが ${backup_count} 個 (合計 ${backup_total}) あります: ${BACKUP_DIR_ABS}"
+                echo "     不要なものは手動で削除してください。"
+            fi
             ;;
         *)
             echo "バックアップをスキップしました。"
