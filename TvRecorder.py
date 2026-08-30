@@ -63,6 +63,26 @@ def format_bytes(size: int) -> str:
 def normalize_str(s: str) -> str:
     return unicodedata.normalize('NFC', s) if isinstance(s, str) else s
 
+# Amatsukaze が出力するファイル名の、元ファイル名に続く部分のパターン
+#   ""       : 番組名.mp4        (通常の出力)
+#   "-1"     : 番組名-1.mp4      (CM分割などによる分割出力)
+#   "-enc"   : 番組名-enc.log    (エンコードログ)
+#   "-1-enc" : 分割出力に対応するログ
+_OUTPUT_SUFFIX_PTN = re.compile(r'^(?:-\d+)?(?:-enc)?$')
+
+def is_output_of(stem: str, base_stem: str) -> bool:
+    """stem が base_stem を元に生成された出力ファイルかどうかを判定する。
+
+    単純な startswith による前方一致だと、例えば「ニュース」の変換時に
+    別番組である「ニュース7」「ニュース速報」の出力まで削除してしまうため、
+    区切り文字（ハイフン）と接尾辞の形を厳密に検査する。
+    """
+    norm_stem = normalize_str(stem)
+    norm_base = normalize_str(base_stem)
+    if not norm_stem.startswith(norm_base):
+        return False
+    return _OUTPUT_SUFFIX_PTN.match(norm_stem[len(norm_base):]) is not None
+
 # =========================================================
 # 1. 設定管理 (Configuration)
 # =========================================================
@@ -596,11 +616,16 @@ class TsConverterPipeline(BasePipeline):
         if self.cfg.dry_run: return True
         try:
             out_dir.mkdir(parents=True, exist_ok=True)
-            norm = normalize_str(stem)
+            # 再変換に備えて、この TS から生成された過去の出力のみを削除する
+            # （別番組を巻き込まないよう is_output_of で厳密に判定する）
             for p in out_dir.iterdir():
-                if p.is_file() and normalize_str(p.stem).startswith(norm): p.unlink()
+                if p.is_file() and is_output_of(p.stem, stem):
+                    p.unlink()
+                    logging.info(f"  -> 既存の変換結果を削除: {p.name}")
             return True
-        except Exception: return False
+        except Exception as e:
+            logging.error(f"  -> 出力先の準備に失敗したため変換をスキップします: {out_dir} ({e})")
+            return False
 
     def _exec_amatsukaze(self, src, out_dir):
         cmd = [self.cfg.amatsukaze_cmd, "-ip", self.cfg.amatsukaze_ip,

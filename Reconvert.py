@@ -4,7 +4,8 @@ import subprocess
 import sys
 import os
 import argparse
-import glob
+import re
+import unicodedata
 from pathlib import Path
 from datetime import datetime
 
@@ -61,15 +62,40 @@ def sync_avs_timestamp(ts_path):
         except Exception as e:
             print(f"  -> Sync Error: {e}")
 
+# Amatsukazeが出力するファイル名の、元ファイル名に続く部分のパターン
+#   ""       : 番組名.mp4        (通常の出力)
+#   "-1"     : 番組名-1.mp4      (CM分割などによる分割出力)
+#   "-enc"   : 番組名-enc.log    (エンコードログ)
+#   "-1-enc" : 分割出力に対応するログ
+OUTPUT_SUFFIX_PTN = re.compile(r'^(?:-\d+)?(?:-enc)?$')
+
+def is_output_of(stem, base_stem):
+    """stem が base_stem を元に生成された出力ファイルかどうかを判定する。
+
+    単純な前方一致だと、例えば「ニュース」の再変換時に別番組である
+    「ニュース7」「ニュース速報」の出力まで削除してしまうため、
+    区切り文字（ハイフン）と接尾辞の形を厳密に検査する。
+    """
+    norm_stem = unicodedata.normalize('NFC', stem)
+    norm_base = unicodedata.normalize('NFC', base_stem)
+    if not norm_stem.startswith(norm_base):
+        return False
+    return OUTPUT_SUFFIX_PTN.match(norm_stem[len(norm_base):]) is not None
+
 def delete_existing_converted_files(target_dir, file_stem):
-    escaped_stem = glob.escape(file_stem)
-    pattern = f"{escaped_stem}*.*"
-    
+    """target_dir 直下から、file_stem を元に生成された過去の出力のみを削除する。
+
+    変換先ツリー全体を再帰検索すると、フォルダ違いの無関係なファイルまで
+    削除対象になるため、対象は出力先ディレクトリ直下に限定する。
+    """
     if not target_dir.exists():
         return
 
-    matched_files = list(target_dir.rglob(pattern))
-    
+    matched_files = sorted(
+        f for f in target_dir.iterdir()
+        if f.is_file() and is_output_of(f.stem, file_stem)
+    )
+
     for f in matched_files:
         if DRY_RUN_MODE:
             print(f"  [DryRun] Would delete: {f.name} (at {f.parent})")
@@ -104,7 +130,7 @@ def convert_single_file(input_file_path, cli_path, server_ip, profile):
         if not DRY_RUN_MODE:
             output_dir.mkdir(parents=True, exist_ok=True)
 
-        delete_existing_converted_files(CONVERTED_BASE, input_path.stem)
+        delete_existing_converted_files(output_dir, input_path.stem)
 
         cmd = [
             cli_path,
