@@ -57,8 +57,15 @@ SERVER_LOG="${TARGET_DIR}/${PROCESS_NAME}.log"
 # 起動確認のタイムアウト（秒）
 STARTUP_TIMEOUT_SEC=30
 
-# 停止要求への応答を待つ時間（秒）。これを過ぎたら強制終了する
-SHUTDOWN_TIMEOUT_SEC=30
+# 停止時に送るシグナルの順序と、それぞれの応答を待つ時間（秒）。
+#
+# Amatsukaze は Ctrl+C (SIGINT) を正規の終了手段として実装しており、2回目の
+# SIGINT では即時終了を許可している (上流 AmatsukazeServerCLI/ServerCLI.cs)。
+# SIGTERM のハンドラも用意されているが、実機では30秒待っても終了しなかったため、
+# SIGINT を先に送り、応答が無い場合のみ段階的に強めていく。
+# 全て駄目なら最後に SIGKILL する。
+STOP_SIGNALS="INT INT TERM"
+STOP_WAIT_SEC=10
 
 # ==============================================================================
 
@@ -232,19 +239,26 @@ if [ -z "$server_pids" ]; then
     echo "  -> 起動中のプロセスはありません。"
 else
     echo "  -> 停止を要求します (PID: ${server_pids})"
-    # shellcheck disable=SC2086
-    kill -TERM $server_pids 2>/dev/null || true
 
-    for _ in $(seq 1 "$SHUTDOWN_TIMEOUT_SEC"); do
-        server_pids="$(find_server_pids)"
+    for sig in $STOP_SIGNALS; do
+        printf "     SIG%s" "$sig"
+        # shellcheck disable=SC2086
+        kill -"$sig" $server_pids 2>/dev/null || true
+
+        for _ in $(seq 1 "$STOP_WAIT_SEC"); do
+            server_pids="$(find_server_pids)"
+            if [ -z "$server_pids" ]; then break; fi
+            sleep 1
+            printf "."
+        done
+
+        echo
         if [ -z "$server_pids" ]; then break; fi
-        sleep 1
-        printf "."
     done
 
     if [ -n "$server_pids" ]; then
-        echo
-        echo "警告: ${SHUTDOWN_TIMEOUT_SEC}秒以内に終了しなかったため強制終了します (PID: ${server_pids})" >&2
+        echo "警告: 停止要求に応答しないため強制終了します (PID: ${server_pids})" >&2
+        echo "      エンコード中だった場合、子プロセスや一時ファイルが残ることがあります。" >&2
         # shellcheck disable=SC2086
         kill -KILL $server_pids 2>/dev/null || true
         sleep 1
