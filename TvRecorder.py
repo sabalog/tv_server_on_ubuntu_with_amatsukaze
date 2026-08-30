@@ -26,6 +26,7 @@ import sys
 import unicodedata
 import fcntl
 import posixpath
+import socket
 import stat
 import re
 import time
@@ -144,6 +145,13 @@ class Config:
     # --- HDDコピー実行許可時間帯 ---
     copy_window_start_hour: int = 3
 
+    # --- タイムアウト設定 (秒) ---
+    # 応答が返らないまま停止すると、ロックを握ったままになり以降の実行が
+    # 全てスキップされ続けるため、外部とのやり取りには必ず上限を設ける。
+    amatsukaze_timeout_sec: int = 60    # AddTaskはタスク登録のみなので短くてよい
+    sftp_connect_timeout_sec: int = 30  # NASへの接続・認証
+    sftp_io_timeout_sec: int = 300      # 転送中の1回の読み書き（ファイル全体ではない）
+
     # --- NAS接続設定 ---
     nas_config: Dict = field(default_factory=lambda: {
         'host': '192.168.1.2',
@@ -205,6 +213,12 @@ class ConditionalBufferHandler(logging.Handler):
         self.file_handler.setFormatter(fmt)
 
     def emit(self, record):
+        # WARNING以上が出たら、その時点で出力モードへ切り替える。
+        # 「何も処理が無ければ出力しない」仕組みのせいで、警告やエラーが
+        # 誰にも見られないまま破棄されるのを防ぐ（それまでの経緯も併せて出す）。
+        if not getattr(self, 'passthrough', False) and record.levelno >= logging.WARNING:
+            self.flush_all(True)
+
         if getattr(self, 'passthrough', False):
             self.stream_handler.handle(record)
             self.file_handler.handle(record)
@@ -730,8 +744,17 @@ class TsConverterPipeline(BasePipeline):
             logging.info(f"  [DryRun] CMD: {cmd}")
             return True
         try:
-            subprocess.run(cmd, capture_output=True, text=True, check=True)
+            subprocess.run(cmd, capture_output=True, text=True, check=True,
+                           timeout=self.cfg.amatsukaze_timeout_sec)
             return True
+        except subprocess.TimeoutExpired:
+            logging.error(f"  -> コマンドが{self.cfg.amatsukaze_timeout_sec}秒応答しないため中断しました: {self.cfg.amatsukaze_cmd}")
+            return False
+        except subprocess.CalledProcessError as e:
+            # 原因究明のため、例外の文字列だけでなくコマンドの出力も残す
+            detail = (e.stderr or "").strip() or (e.stdout or "").strip() or "(出力なし)"
+            logging.error(f"  -> コマンド失敗 (終了コード {e.returncode}): {detail}")
+            return False
         except Exception as e:
             logging.error(f"  -> コマンド失敗: {e}")
             return False
@@ -791,15 +814,35 @@ class Mp4UploadPipeline(BasePipeline):
 
     def _connect_sftp(self):
         c = self.cfg.nas_config
+        t = None
         try:
-            t = paramiko.Transport((c['host'], c['port']))
+            # Transportにホスト名を渡すとOS既定(数分)まで待つため、接続は自前で行う
+            sock = socket.create_connection((c['host'], c['port']),
+                                            timeout=self.cfg.sftp_connect_timeout_sec)
+            t = paramiko.Transport(sock)
+            t.banner_timeout = self.cfg.sftp_connect_timeout_sec
+            t.auth_timeout = self.cfg.sftp_connect_timeout_sec
+
             if c['key_file']:
                 k = paramiko.RSAKey.from_private_key_file(c['key_file'])
                 t.connect(username=c['user'], pkey=k)
             else:
                 t.connect(username=c['user'], password=c['password'])
-            return paramiko.SFTPClient.from_transport(t), t
-        except Exception: return None, None
+
+            sftp = paramiko.SFTPClient.from_transport(t)
+            if sftp is None:
+                raise IOError("SFTPセッションを開けませんでした")
+
+            # 転送中に応答が途絶えたまま停止しないようにする
+            sftp.get_channel().settimeout(self.cfg.sftp_io_timeout_sec)
+            return sftp, t
+        except Exception as e:
+            # 認証NG・名前解決失敗・タイムアウトを切り分けられるよう理由を残す
+            logging.error(f"[NAS] SFTP接続に失敗しました ({c['user']}@{c['host']}:{c['port']}): {e}")
+            if t is not None:
+                try: t.close()
+                except Exception: pass
+            return None, None
 
     def _scan_candidates(self) -> Generator[Dict, None, None]:
         dest_root = self.cfg.nas_config['dest_dir']
