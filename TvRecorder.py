@@ -960,6 +960,9 @@ class Mp4UploadPipeline(BasePipeline):
 class TsBackupPipeline(BasePipeline):
     """Phase 3: TS -> HDD バックアップ"""
 
+    # コピー中の一時ファイルにつける印
+    COPY_TMP_MARK = ".copytmp"
+
     def run(self):
         if not self._verify_mounts("Phase 3", self.cfg.source_dir_ts): return
 
@@ -1035,12 +1038,37 @@ class TsBackupPipeline(BasePipeline):
             priority_dirs.append(pol["dir"])
             
         self.cleaner.enforce_size_limit(self.cfg.dest_dir_hdd, self.cfg.max_size_hdd_gb, self.cfg.hdd_exclude_dirs, priority_dirs)
-        
+
+        # 中断されたコピーの一時ファイルを掃除する
+        self._cleanup_stale_copy_tmp()
+
         # 孤立した（対応する.tsが存在しない）.trim.avsの削除を追加
         self._cleanup_orphaned_avs()
         
         self._cleanup_empty_dirs_local(self.cfg.source_dir_ts)
         self._cleanup_empty_dirs_local(self.cfg.dest_dir_hdd)
+
+    def _copy_tmp_path(self, dest: Path) -> Path:
+        return dest.with_name(f"{dest.name}{self.COPY_TMP_MARK}.{os.getpid()}")
+
+    def _cleanup_stale_copy_tmp(self):
+        """強制終了などで取り残されたコピー中の一時ファイルを削除する。
+
+        排他ロックにより同時実行はないため、この時点で残っているものは
+        全て中断されたコピーの残骸。放置するとTS1本分の容量を占有し続ける。
+        """
+        if not self.cfg.dest_dir_hdd.exists(): return
+
+        for p in self.cfg.dest_dir_hdd.rglob(f"*{self.COPY_TMP_MARK}.*"):
+            try:
+                if not p.is_file(): continue
+                size_str = format_bytes(p.stat().st_size)
+            except OSError: continue
+
+            self.cfg.write_log = True
+            activate_realtime_log()
+            logging.warning(f"  [Backup] 中断されたコピーの一時ファイルを削除します: {p.name} ({size_str})")
+            self.ops.delete_file(p)
 
     def _cleanup_orphaned_avs(self):
         if not self.cfg.source_dir_ts.exists(): return
@@ -1113,26 +1141,38 @@ class TsBackupPipeline(BasePipeline):
         if self.cfg.dry_run:
             logging.info(f"  [DryRun] Copy to: {dest}")
             return True
+
+        # 一時ファイルへコピーしてから置き換える。
+        # 直接 dest へ書くと、コピー途中で失敗した場合に、それまで正常だった
+        # 既存のバックアップまで失ってしまう。
+        # （既存ファイルはコピー完了まで残るため、一時的に2ファイル分の空きが必要）
+        tmp_dest = self._copy_tmp_path(dest)
         try:
             dest.parent.mkdir(parents=True, exist_ok=True)
-            if dest.exists(): dest.unlink()
-            
+
             file_size = src.stat().st_size
             free_space = shutil.disk_usage(dest.parent).free
-
             if free_space < file_size:
                 logging.error(f"  -> HDD容量不足 (空き: {format_bytes(free_space)}, 必要: {format_bytes(file_size)})")
                 return False
-            
+
             logging.info(f"  -> Copy開始 ({format_bytes(file_size)})")
             start = time.time()
-            shutil.copy2(src, dest)
+            shutil.copy2(src, tmp_dest)
+            os.replace(tmp_dest, dest)
             dur = time.time() - start
             logging.info(f"  -> Copy完了 (所要時間: {dur:.1f}秒)")
             return True
         except Exception as e:
             logging.error(f"  -> Copy失敗: {e}")
             return False
+        finally:
+            # 失敗時に書きかけの一時ファイルを残さない（HDDを圧迫するため）
+            if tmp_dest.exists():
+                try:
+                    tmp_dest.unlink()
+                except OSError as e:
+                    logging.warning(f"  -> 一時ファイルを削除できません: {tmp_dest} ({e})")
 
 
 # =========================================================
