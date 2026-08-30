@@ -359,6 +359,10 @@ class StateManager:
 # =========================================================
 
 class DiskOperations(ABC):
+    # 直近の list_files_recursive() が途中でエラーになり、一覧が不完全かどうか。
+    # 不完全な一覧のまま容量を計算すると掃除処理が誤判断するため、呼び出し側が確認する。
+    listing_incomplete = False
+
     @abstractmethod
     def list_files_recursive(self, root_dir: Union[Path, str], exclude_dirs: List[str] = None) -> Generator[FileEntry, None, None]:
         pass
@@ -404,14 +408,19 @@ class LocalDiskOperations(DiskOperations):
             path.unlink()
             logging.info(f"    削除: {path} ({size_str})")
             return True
-        except Exception: return False
+        except Exception as e:
+            # 無言で失敗すると、容量上限がいつまでも効かないまま満杯になる
+            logging.warning(f"    削除失敗: {path} ({e})")
+            return False
 
     def remove_empty_dir(self, path: Path) -> bool:
         if self.dry_run: return True
         try:
             path.rmdir()
             return True
-        except OSError: return False
+        except OSError as e:
+            logging.warning(f"    空ディレクトリの削除失敗: {path} ({e})")
+            return False
 
     def exists(self, path: Path) -> bool:
         return path.exists()
@@ -423,15 +432,19 @@ class RemoteDiskOperations(DiskOperations):
 
     def list_files_recursive(self, root_dir: str, exclude_dirs: List[str] = None) -> Generator[FileEntry, None, None]:
         exclude_markers = exclude_dirs or []
-        try:
-            for path, attr, is_dir in self._sftp_walk(root_dir):
-                if not is_dir:
-                    if any(m in path for m in exclude_markers): continue
+        self.listing_incomplete = False
+
+        for path, attr, is_dir in self._sftp_walk(root_dir):
+            if not is_dir:
+                if any(m in path for m in exclude_markers): continue
+                try:
                     yield FileEntry(
                         path=path, name=posixpath.basename(path), size=attr.st_size,
                         mtime=datetime.fromtimestamp(attr.st_mtime)
                     )
-        except Exception: pass
+                except Exception as e:
+                    self.listing_incomplete = True
+                    logging.warning(f"  [NAS] ファイル情報を取得できません: {path} ({e})")
 
     def delete_file(self, path: str) -> bool:
         size_str = "Unknown"
@@ -445,20 +458,37 @@ class RemoteDiskOperations(DiskOperations):
         try:
             self.sftp.remove(path)
             logging.info(f"    削除(NAS): {posixpath.basename(path)} ({size_str})")
-            
-            if path.endswith('.mp4'):
-                ass = str(Path(path).with_suffix('.ass'))
-                if self.exists(ass):
+        except Exception as e:
+            logging.warning(f"    削除失敗(NAS): {path} ({e})")
+            return False
+
+        # 付随する字幕ファイルの削除に失敗しても、本体の削除自体は成功とみなす
+        if path.endswith('.mp4'):
+            ass = posixpath.splitext(path)[0] + '.ass'
+            if self.exists(ass):
+                try:
                     self.sftp.remove(ass)
-            return True
-        except Exception: return False
+                except Exception as e:
+                    logging.warning(f"    字幕ファイルの削除失敗(NAS): {ass} ({e})")
+        return True
 
     def remove_empty_dir(self, path: str) -> bool:
+        # rmdir の失敗で空かどうかを判定していると、本当のエラーを検知できず、
+        # dry-run では中身のあるディレクトリまで「削除」と表示されてしまう。
+        # 空かどうかは列挙して明示的に判定する。
+        try:
+            if self.sftp.listdir(path): return False
+        except Exception as e:
+            logging.warning(f"  [NAS] ディレクトリを確認できません: {path} ({e})")
+            return False
+
         if self.dry_run: return True
         try:
             self.sftp.rmdir(path)
             return True
-        except Exception: return False
+        except Exception as e:
+            logging.warning(f"  [NAS] 空ディレクトリの削除失敗: {path} ({e})")
+            return False
 
     def exists(self, path: str) -> bool:
         try:
@@ -467,15 +497,22 @@ class RemoteDiskOperations(DiskOperations):
         except FileNotFoundError: return False
 
     def _sftp_walk(self, remote_path):
+        # 列挙に失敗したディレクトリがあっても、そこだけ諦めて走査は続ける。
+        # ただし一覧が不完全になった事実は記録し、呼び出し側が判断できるようにする。
         try:
-            for attr in self.sftp.listdir_attr(remote_path):
-                full_path = posixpath.join(remote_path, attr.filename)
-                if stat.S_ISDIR(attr.st_mode):
-                    yield from self._sftp_walk(full_path)
-                    yield (full_path, attr, True)
-                else:
-                    yield (full_path, attr, False)
-        except Exception: pass
+            entries = self.sftp.listdir_attr(remote_path)
+        except Exception as e:
+            self.listing_incomplete = True
+            logging.warning(f"  [NAS] ディレクトリを列挙できません: {remote_path} ({e})")
+            return
+
+        for attr in entries:
+            full_path = posixpath.join(remote_path, attr.filename)
+            if stat.S_ISDIR(attr.st_mode):
+                yield from self._sftp_walk(full_path)
+                yield (full_path, attr, True)
+            else:
+                yield (full_path, attr, False)
 
 
 class Cleaner:
@@ -484,10 +521,36 @@ class Cleaner:
         self.ops = ops
         self.label = label
 
+    def _warn(self, message: str):
+        """掃除処理の警告。埋もれないよう必ず出力する。"""
+        self.cfg.write_log = True
+        activate_realtime_log()
+        logging.warning(f"  {self.label} {message}")
+
+    def _listing_is_complete(self, target_dir: Union[Path, str]) -> bool:
+        """一覧が最後まで取得できたか。不完全なら容量計算が信用できない。"""
+        if not getattr(self.ops, 'listing_incomplete', False):
+            return True
+        self._warn(f"一覧を最後まで取得できなかったため、削除処理を見送ります [{target_dir}]")
+        return False
+
+    def _delete_all(self, delete_list: List[FileEntry]) -> int:
+        """削除を実行し、失敗があれば警告する。戻り値は削除できた件数。"""
+        deleted = 0
+        for f in delete_list:
+            if self.ops.delete_file(f.path):
+                deleted += 1
+
+        failed = len(delete_list) - deleted
+        if failed:
+            self._warn(f"{failed}ファイルの削除に失敗しました（想定した容量を確保できていません）")
+        return deleted
+
     def enforce_size_limit(self, target_dir: Union[Path, str], limit_gb: float, exclude_dirs: List[str], priority_dirs: List[str] = None):
         if not self.ops.exists(target_dir): return
 
         all_files = list(self.ops.list_files_recursive(target_dir, exclude_dirs=[]))
+        if not self._listing_is_complete(target_dir): return
         total_size = sum(f.size for f in all_files)
         original_total_size = total_size
 
@@ -520,20 +583,29 @@ class Cleaner:
         
         limit_bytes = limit_gb * (1024**3)
         delete_list = []
-        
+
         if total_size > limit_bytes:
             for f in deletable_files:
                 delete_list.append(f)
                 total_size -= f.size
                 if total_size <= limit_bytes: break
-        
+
+            # 上限を超えているのに減らせない場合、放置すると満杯になるため必ず知らせる
+            if not delete_list:
+                self._warn(f"容量上限を超えていますが、削除できるファイルがありません "
+                           f"[{target_dir}]: {format_bytes(original_total_size)} / 上限 {limit_gb}GB "
+                           f"(全て除外対象です)")
+            elif total_size > limit_bytes:
+                self._warn(f"削除できるファイルを全て削除しても容量上限を下回りません "
+                           f"[{target_dir}]: {format_bytes(original_total_size)} -> "
+                           f"{format_bytes(total_size)} / 上限 {limit_gb}GB")
+
         if delete_list:
             self.cfg.write_log = True
             activate_realtime_log()
             logging.info(f"  {self.label} 現在の全体容量 [{target_dir}]: {format_bytes(original_total_size)}")
             logging.info(f"  {self.label} 全体容量制限チェック [{target_dir}]: 上限 {limit_gb}GB -> {len(delete_list)}ファイル削除")
-            for f in delete_list:
-                self.ops.delete_file(f.path)
+            self._delete_all(delete_list)
 
     def apply_retention_policy(self, parent_dir: Union[Path, str], dir_name: str, days: int, limit_gb: int):
         if isinstance(parent_dir, Path):
@@ -544,6 +616,8 @@ class Cleaner:
         if not self.ops.exists(target): return
 
         files = list(self.ops.list_files_recursive(target))
+        if not self._listing_is_complete(target): return
+
         total_size = sum(f.size for f in files)
         original_total_size = total_size
 
@@ -565,8 +639,7 @@ class Cleaner:
             activate_realtime_log()
             logging.info(f"  {self.label} 現在の容量 [{target}]: {format_bytes(original_total_size)}")
             logging.info(f"  {self.label} ポリシー適用 [{dir_name}]: {len(delete_list)}ファイル削除")
-            for f in delete_list:
-                self.ops.delete_file(f.path)
+            self._delete_all(delete_list)
 
     def delete_old_files_by_pattern(self, target_dir: Union[Path, str], days: int, pattern: str):
         """target_dir 配下の古いファイルを、日数条件のみで無条件に削除する。
@@ -604,6 +677,10 @@ class Cleaner:
                         if self.ops.exists(avs_path):
                             self.ops.delete_file(avs_path)
             logging.info(f"    -> {count}ファイル削除")
+
+            failed = len(delete_list) - count
+            if failed:
+                self._warn(f"{failed}ファイルの削除に失敗しました（想定した容量を確保できていません）")
 
 
 # =========================================================
