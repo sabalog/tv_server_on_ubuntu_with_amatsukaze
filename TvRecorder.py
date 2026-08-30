@@ -1086,14 +1086,43 @@ class Mp4UploadPipeline(BasePipeline):
             self.state.update_entry(StateManager.SECTION_UPLOAD_NAS, task['name'], task['size'], self.cfg.dry_run)
         return True
 
+    def _has_free_space(self, dest: str, need_bytes: int) -> bool:
+        """NAS側の空き容量を確認する。
+
+        statvfs はSFTPの拡張機能のため、サーバが未対応なら確認できない。
+        その場合は従来どおり転送を試みる（確認できないことを理由に止めない）。
+        """
+        try:
+            vfs = self.sftp.statvfs(posixpath.dirname(dest))
+            free = vfs.f_bavail * vfs.f_frsize
+        except Exception:
+            return True
+
+        # 既存ファイルを上書きする場合、その分の領域は解放される
+        try:
+            need_bytes -= self.sftp.stat(dest).st_size
+        except Exception:
+            pass
+
+        if free < need_bytes:
+            logging.error(f"  -> NAS容量不足 (空き: {format_bytes(free)}, "
+                          f"必要: {format_bytes(need_bytes)})")
+            return False
+        return True
+
     def _upload(self, src, dest):
         if self.cfg.dry_run:
             logging.info("  [DryRun] Uploaded.")
             return True
         try:
             self._mkdir_p(posixpath.dirname(dest))
-            
-            size_str = format_bytes(src.stat().st_size)
+
+            file_size = src.stat().st_size
+            # 満杯のまま毎回転送を試みて途中まで書き込むのを避ける
+            if not self._has_free_space(dest, file_size):
+                return False
+
+            size_str = format_bytes(file_size)
             logging.info(f"  -> Upload開始 ({size_str})")
             start = time.time()
             self.sftp.put(str(src), dest)
