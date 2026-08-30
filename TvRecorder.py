@@ -268,6 +268,21 @@ def acquire_lock(lock_path: Path):
         return None
 
 class StateManager:
+    """処理済みファイルの記録 (INI)。
+
+    キーは「ファイル名のみ」とし、フォルダ構成には依存させない。これは
+    delete_after_watch/ や keep/ への移動、フォルダの整理などでファイルが
+    動いても「処理済み」の判定を維持するための意図的な設計である。
+    相対パスをキーにすると、移動のたびに未処理と判定されて再変換・
+    再バックアップ・再転送が走り、HDDやNASに同じ番組が二重に残る。
+
+    この方式では同名かつ同一サイズの別ファイルを区別できないが、TSのサイズが
+    完全に一致することは確率的に起こらない、という前提を置いている。
+    各スキャンにある seen_names（同名ファイルを1件に絞る処理）も同じ前提を
+    守るためのもので、外すと同名ファイル同士がINIの同一キーを上書きし合い、
+    毎回どちらかが未処理と判定されて再処理を繰り返す。併せて維持すること。
+    """
+
     SECTION_COPY_HDD = 'CopyHDD'
     SECTION_CONVERT = 'Convert'
     SECTION_UPLOAD_NAS = 'UploadNAS'
@@ -765,6 +780,8 @@ class TsConverterPipeline(BasePipeline):
     def _scan(self):
         if not self.cfg.source_dir_ts.exists(): return
         threshold = datetime.now() - timedelta(seconds=self.cfg.scan_threshold_sec)
+        # 状態管理のキーがファイル名のみのため、同名ファイルを複数処理すると
+        # INIの同一キーを上書きし合ってしまう。詳細は StateManager の説明を参照
         seen_names = set()
         
         for p in self.cfg.source_dir_ts.rglob('*.ts'):
@@ -959,6 +976,8 @@ class Mp4UploadPipeline(BasePipeline):
         dest_root = self.cfg.nas_config['dest_dir']
         threshold = datetime.now() - timedelta(seconds=self.cfg.scan_threshold_sec)
         exclude_ptn = re.compile(r'-\d+$')
+        # 状態管理のキーがファイル名のみのため、同名ファイルを複数処理すると
+        # INIの同一キーを上書きし合ってしまう。詳細は StateManager の説明を参照
         seen_names = set()
 
         for p in self.cfg.converted_dir.rglob('*.mp4'):
@@ -1139,6 +1158,8 @@ class TsBackupPipeline(BasePipeline):
     def _scan(self):
         if not self.cfg.source_dir_ts.exists(): return
         threshold = datetime.now() - timedelta(seconds=self.cfg.scan_threshold_sec)
+        # 状態管理のキーがファイル名のみのため、同名ファイルを複数処理すると
+        # INIの同一キーを上書きし合ってしまう。詳細は StateManager の説明を参照
         seen_names = set()
 
         for p in self.cfg.source_dir_ts.rglob('*.ts'):
