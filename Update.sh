@@ -48,6 +48,12 @@ PORT=32768
 # プロセス名および実行ファイル名
 PROCESS_NAME="AmatsukazeServerCLI"
 
+# サーバの標準出力・標準エラーの記録先（起動失敗の原因調査に使う）
+SERVER_LOG="${TARGET_DIR}/${PROCESS_NAME}.log"
+
+# 起動確認のタイムアウト（秒）
+STARTUP_TIMEOUT_SEC=30
+
 # ==============================================================================
 
 # 引数が指定されているかチェック（set -u 環境では ${1:-} と書かないとエラーになる）
@@ -167,8 +173,79 @@ fi
 # 展開先に移動
 cd "$TARGET_DIR" || die "展開先ディレクトリへ移動できません: ${TARGET_DIR}"
 
-# バックグラウンドで起動
-echo "${PROCESS_NAME} をポート ${PORT} で起動します..."
-./exe_files/${PROCESS_NAME} -p "$PORT" &
+# ==============================================================================
+# 4. 起動と起動確認
+# ==============================================================================
+EXE_PATH="./exe_files/${PROCESS_NAME}"
+if [ ! -x "$EXE_PATH" ]; then
+    die "実行ファイルが見つからないか実行権限がありません: ${TARGET_DIR}/${EXE_PATH#./}"
+fi
 
+echo "${PROCESS_NAME} をポート ${PORT} で起動します..."
+
+# nohup + disown で端末から切り離す。
+# これが無いと、SSH を切断した時に SIGHUP でサーバまで終了してしまう。
+# 出力を捨てると起動失敗の原因を追えないため、ログファイルへ追記する。
+nohup "$EXE_PATH" -p "$PORT" >> "$SERVER_LOG" 2>&1 &
+SERVER_PID=$!
+disown "$SERVER_PID" 2>/dev/null || true
+
+# ポートの待ち受けを確認する手段があるか調べる
+port_check_cmd=""
+if command -v ss > /dev/null 2>&1; then
+    port_check_cmd="ss"
+elif command -v netstat > /dev/null 2>&1; then
+    port_check_cmd="netstat"
+fi
+
+is_listening() {
+    case "$port_check_cmd" in
+        ss)      ss -ltn 2>/dev/null | grep -q ":${PORT} " ;;
+        netstat) netstat -ltn 2>/dev/null | grep -q ":${PORT} " ;;
+        *)       return 1 ;;
+    esac
+}
+
+report_failure() {
+    echo "エラー: $1" >&2
+    echo "        ログの末尾を表示します (${SERVER_LOG}):" >&2
+    tail -n 20 "$SERVER_LOG" >&2 || true
+    exit 1
+}
+
+# バックグラウンド起動は成否が終了コードに現れないため、明示的に確認する
+printf "起動を確認しています"
+started=false
+for _ in $(seq 1 "$STARTUP_TIMEOUT_SEC"); do
+    if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+        echo
+        report_failure "${PROCESS_NAME} が起動直後に終了しました。"
+    fi
+
+    if [ -z "$port_check_cmd" ]; then
+        # ss も netstat も無い環境では、プロセスの生存のみを確認する
+        sleep 3
+        echo
+        echo "警告: ポートの確認手段(ss/netstat)が無いため、待ち受け開始は未確認です。" >&2
+        started=true
+        break
+    fi
+
+    if is_listening; then
+        echo
+        started=true
+        break
+    fi
+
+    sleep 1
+    printf "."
+done
+
+if [ "$started" != true ]; then
+    echo
+    report_failure "${STARTUP_TIMEOUT_SEC}秒以内にポート ${PORT} の待ち受けを開始しませんでした。"
+fi
+
+echo "${PROCESS_NAME} が起動しました (PID: ${SERVER_PID}, ポート: ${PORT})"
+echo "ログ: ${SERVER_LOG}"
 echo "処理が完了しました。"
