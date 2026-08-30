@@ -864,6 +864,9 @@ class TsConverterPipeline(BasePipeline):
                            timeout=self.cfg.amatsukaze_timeout_sec)
             return True
         except subprocess.TimeoutExpired:
+            # subprocess は直接の子だけを停止するため、孫プロセスがいた場合は
+            # 孤児として残る。Linux では process.wait() で即座に戻るので処理が
+            # 滞ることはなく、AddTask は子を持たないため許容している。
             logging.error(f"  -> コマンドが{self.cfg.amatsukaze_timeout_sec}秒応答しないため中断しました: {self.cfg.amatsukaze_cmd}")
             return False
         except subprocess.CalledProcessError as e:
