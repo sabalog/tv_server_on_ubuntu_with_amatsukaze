@@ -1058,36 +1058,66 @@ class TsBackupPipeline(BasePipeline):
 # メイン処理
 # =========================================================
 
-def main():
+PIPELINES = [
+    ("Phase 1 (Converter)", TsConverterPipeline),
+    ("Phase 2 (Upload)", Mp4UploadPipeline),
+    ("Phase 3 (Backup)", TsBackupPipeline),
+]
+
+def main() -> int:
+    """終了コードを返す。0=正常、1=いずれかの処理が異常終了。
+
+    cron や systemd から失敗を検知できるよう、異常時は必ず非0で終了する。
+    """
     cfg = Config()
-    
+
     lock_fd = acquire_lock(cfg.lock_file)
-    if lock_fd is None: return
+    # 先行プロセスが実行中。異常ではないので正常終了扱いとする
+    if lock_fd is None: return 0
 
-    logger = setup_logger(cfg.log_file)
+    try:
+        logger = setup_logger(cfg.log_file)
+    except Exception as e:
+        print(f"【エラー】ログの初期化に失敗しました: {e}", file=sys.stderr)
+        lock_fd.close()
+        return 1
 
+    failures = []
     try:
         state = StateManager(cfg.ini_file)
         mode = "DryRun" if cfg.dry_run else "Production"
-        
+
         # NOTE: 起動と終了のログは cfg.write_log が True になった時（=何らかの処理が行われた時）のみ
         # flush_all() 時に一緒に出力される仕組みになっています。
         logging.info(f"=== TV Recorder Manager Start [{mode}] ===")
 
-        TsConverterPipeline(cfg, state).run()
-        Mp4UploadPipeline(cfg, state).run()
-        TsBackupPipeline(cfg, state).run()
+        # 1つのフェーズが予期しない例外で落ちても、後続のフェーズは実行する。
+        # （例: 変換フェーズの失敗で、NAS転送やバックアップまで止めない）
+        for name, pipeline_cls in PIPELINES:
+            try:
+                pipeline_cls(cfg, state).run()
+            except Exception as e:
+                failures.append(name)
+                cfg.write_log = True
+                activate_realtime_log()
+                logging.exception(f"[{name}] 予期しないエラーで中断しました: {e}")
 
-        logging.info("=== All Finished ===")
+        if failures:
+            logging.error(f"=== 異常終了: {len(failures)}フェーズが失敗しました ({', '.join(failures)}) ===")
+        else:
+            logging.info("=== All Finished ===")
 
     except Exception as e:
+        failures.append("初期化")
         cfg.write_log = True
         logging.exception(f"Unexpected Error: {e}")
 
     finally:
         logger.flush_all(cfg.write_log)
         logger.close()
-        if lock_fd: lock_fd.close()
+        lock_fd.close()
+
+    return 1 if failures else 0
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
