@@ -57,15 +57,17 @@ SERVER_LOG="${TARGET_DIR}/${PROCESS_NAME}.log"
 # 起動確認のタイムアウト（秒）
 STARTUP_TIMEOUT_SEC=30
 
-# 停止時に送るシグナルの順序と、それぞれの応答を待つ時間（秒）。
+# 停止時に送るシグナルと、応答を待つ時間（秒）。
 #
-# Amatsukaze は Ctrl+C (SIGINT) を正規の終了手段として実装しており、2回目の
-# SIGINT では即時終了を許可している (上流 AmatsukazeServerCLI/ServerCLI.cs)。
-# SIGTERM のハンドラも用意されているが、実機では30秒待っても終了しなかったため、
-# SIGINT を先に送り、応答が無い場合のみ段階的に強めていく。
-# 全て駄目なら最後に SIGKILL する。
-STOP_SIGNALS="INT INT TERM"
-STOP_WAIT_SEC=10
+# 実機の AmatsukazeServerCLI は SIGINT にも SIGTERM にも応答しない
+# （上流にハンドラは実装されているが機能していない。停止用のCLIコマンドも無い）。
+# 待っても無駄なので、作法として SIGINT を送って短時間だけ待ち、応答が無ければ
+# SIGKILL する。将来のバージョンで応答するようになれば、そちらが使われる。
+#
+# サーバは停止時に特別な後始末をしない（EndServer() はメッセージループを
+# 終わらせるだけ）ため、強制終了の影響はエンコード中断時の一時ファイル程度。
+STOP_SIGNAL="INT"
+STOP_WAIT_SEC=3
 
 # ==============================================================================
 
@@ -238,32 +240,32 @@ server_pids="$(find_server_pids)"
 if [ -z "$server_pids" ]; then
     echo "  -> 起動中のプロセスはありません。"
 else
-    echo "  -> 停止を要求します (PID: ${server_pids})"
+    echo "  -> 停止を要求します (PID: ${server_pids}, SIG${STOP_SIGNAL})"
+    # shellcheck disable=SC2086
+    kill -"$STOP_SIGNAL" $server_pids 2>/dev/null || true
 
-    for sig in $STOP_SIGNALS; do
-        printf "     SIG%s" "$sig"
-        # shellcheck disable=SC2086
-        kill -"$sig" $server_pids 2>/dev/null || true
-
-        for _ in $(seq 1 "$STOP_WAIT_SEC"); do
-            server_pids="$(find_server_pids)"
-            if [ -z "$server_pids" ]; then break; fi
-            sleep 1
-            printf "."
-        done
-
-        echo
+    for _ in $(seq 1 "$STOP_WAIT_SEC"); do
+        server_pids="$(find_server_pids)"
         if [ -z "$server_pids" ]; then break; fi
+        sleep 1
     done
 
-    if [ -n "$server_pids" ]; then
-        echo "警告: 停止要求に応答しないため強制終了します (PID: ${server_pids})" >&2
-        echo "      エンコード中だった場合、子プロセスや一時ファイルが残ることがあります。" >&2
+    if [ -z "$server_pids" ]; then
+        echo "  -> 停止しました。"
+    else
+        echo "  -> ${STOP_WAIT_SEC}秒待っても応答が無いため強制終了します (PID: ${server_pids})"
+        echo "     エンコード中だった場合、子プロセスや一時ファイルが残ることがあります。"
         # shellcheck disable=SC2086
         kill -KILL $server_pids 2>/dev/null || true
         sleep 1
-    else
-        echo "  -> 停止しました。"
+
+        # 停止できないまま展開へ進むと、旧サーバが動いたまま実行ファイルを
+        # 置き換えることになるため、ここで必ず確認する
+        server_pids="$(find_server_pids)"
+        if [ -n "$server_pids" ]; then
+            die "プロセスを停止できませんでした (PID: ${server_pids})。手動で停止してから再実行してください。"
+        fi
+        echo "  -> 強制終了しました。"
     fi
 fi
 
