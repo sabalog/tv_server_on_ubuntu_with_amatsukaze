@@ -37,6 +37,12 @@ bash -n Update.sh
 
 # 本番の挙動確認は Config.dry_run = True で行う
 #   dry_run 中は Phase 3 の時間帯制限も無視されるため全フェーズが動く
+
+# Reconvert.py は --dry-run (-n) で変更せずに動作を確認できる
+./Reconvert.py -n
+
+# Update.sh は第1引数にバージョン。EXPECTED_SHA256 を渡すと取得物を照合する
+./Update.sh 1.0.9.0
 ```
 
 ### ロジック検証用のハーネス
@@ -65,6 +71,16 @@ tv.activate_realtime_log = lambda: None      # logging.basicConfig で観測す�
 `main()` を通す場合は `tv.Config = lambda: cfg` で差し替える。
 SFTP を伴う経路は、`listdir_attr` / `stat` / `put` / `rmdir` を持つ偽オブジェクトを
 `_connect_sftp` の戻り値として注入する。
+
+**Windows では再現できないもの**（検証済みと書く前に確認すること）:
+
+- パーミッション（`chmod 600` が反映されず、常に緩い状態として観測される）
+- シグナル（`trap "" TERM` が効かず、無視するプロセスを模擬できない）
+- `ss` / `netstat`（Windows版は別物。Linux の `ss -ltn` 相当を自作して差し替える）
+- `subprocess` のタイムアウト後の挙動（POSIX と Windows で実装が異なる）
+
+これらは stub や `find_server_pids` の差し替えで「制御フローの到達」までは確認できる。
+実挙動が確認できていない場合は、その旨を明示すること。
 
 ## アーキテクチャ
 
@@ -104,6 +120,28 @@ SFTP を伴う経路は、`listdir_attr` / `stat` / `put` / `rmdir` を持つ偽
 
 この mtime の一致／不一致が状態を表しているため、`os.utime` の呼び出しを安易に消さないこと。
 
+### 排他ロック（2つのスクリプトで共有）
+
+`TvRecorder.py` と `Reconvert.py` は同じ `/tmp/TvRecorder.lock` を flock する
+（`Config.lock_file` と `Reconvert.LOCK_FILE`。**変更するときは両方揃えること**）。
+同時に動くと、変換結果の削除とNAS転送が競合したり、同じTSが二重登録される。
+
+`Reconvert.py` がロックを取るのは**利用者の選択が終わってから**。選択待ちの間
+握っていると、プロンプトを開いたまま離席された場合に cron 側が停止するため。
+
+### `Update.sh` の構成
+
+`set -euo pipefail` + ERR トラップ + `die()` で、どこで失敗しても無言終了しない。
+処理は 1.バックアップ → 2.ダウンロードと検証 → 3.停止と展開 → 4.起動と起動確認 の順。
+
+- 破壊的操作（プロセス停止・上書き展開）の**前**に、バックアップと書庫の検証を終える
+- バックアップ・展開・起動のいずれかに失敗したらそこで `exit 1`。起動は
+  ポートの待ち受けを確認するまで成功としない
+- サーバは `nohup` で起動しログへ追記する（SSH切断で落ちないため）
+- 停止対象は `/proc/*/cmdline` の argv[0] 一致で特定する。`pkill -f` だと
+  ログを開いている `tail` を巻き込み、`-f` 無しだとプロセス名15文字の壁で
+  `AmatsukazeServerCLI`（19文字）に一致しない
+
 ## 意図的な設計（バグに見えるが変更してはいけない箇所）
 
 - **状態管理のキーはファイル名のみ**（相対パスではない）。`delete_after_watch/` や
@@ -117,6 +155,17 @@ SFTP を伴う経路は、`listdir_attr` / `stat` / `put` / `rmdir` を持つ偽
   バックアップ未完了を理由に削除を見送ると本来の目的を果たせない。
 - **静穏時に何も出力しないログ設計**は仕様。異常を握りつぶしているわけではなく、
   WARNING 以上が出れば経緯ごと必ず出力される。
+- **`Update.sh` がサーバを SIGKILL 前提で止めるのは、調査のうえでの判断**。
+  実機で **SIGTERM は30秒待っても応答しなかった**（確認済み）。上流の
+  `AmatsukazeServerCLI/ServerCLI.cs` には SIGINT / SIGTERM 双方のハンドラが
+  あるが、SIGTERM 側（`AssemblyLoadContext.Unloading`）は機能していない。
+  **SIGINT が効くかは実機で未確認**。`AmatsukazeAddTask` に停止コマンドは無い
+  （確認済み）ため、シグナル以外の手段が無い。
+  現在は SIGINT を送って3秒だけ待ち、応答が無ければ SIGKILL する。応答する
+  バージョンになればそのまま穏当に停止する。
+  サーバは停止時に後始末をしない（`EndServer()` はメッセージループを終わらせる
+  だけ）ので、強制終了の影響はエンコード中断時の一時ファイル程度。
+  恒久対策を検討するなら systemd サービス化が本命。
 
 ## 変更時の注意
 
