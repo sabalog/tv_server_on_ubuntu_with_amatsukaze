@@ -54,6 +54,9 @@ SERVER_LOG="${TARGET_DIR}/${PROCESS_NAME}.log"
 # 起動確認のタイムアウト（秒）
 STARTUP_TIMEOUT_SEC=30
 
+# 停止要求への応答を待つ時間（秒）。これを過ぎたら強制終了する
+SHUTDOWN_TIMEOUT_SEC=30
+
 # ==============================================================================
 
 # 引数が指定されているかチェック（set -u 環境では ${1:-} と書かないとエラーになる）
@@ -150,9 +153,58 @@ fi
 # ==============================================================================
 # 3. プロセス停止・展開・再起動
 # ==============================================================================
-# プロセスを全てkill
+# 起動中のサーバのPIDを列挙する。
+#
+# pkill -f はコマンドライン全体と照合するため、ログを開いている
+# `tail -f .../AmatsukazeServerCLI.log` のような無関係なプロセスまで巻き込む。
+# 一方 -f を外すとプロセス名の照合になるが、15文字までしか比較されないため
+# AmatsukazeServerCLI (19文字) では一致しない。
+# そこで argv[0]（起動時に指定された実行ファイル）だけを見て判定する。
+# ログファイル名などは argv[1] 以降に現れるので誤爆しない。
+find_server_pids() {
+    local pids="" cmdline_file pid cmd0
+    for cmdline_file in /proc/[0-9]*/cmdline; do
+        [ -r "$cmdline_file" ] || continue
+        pid="${cmdline_file#/proc/}"
+        pid="${pid%/cmdline}"
+        # bash の read は -d '' で NUL 区切り、つまり argv[0] だけを読み取れる
+        cmd0=""
+        IFS= read -r -d '' cmd0 < "$cmdline_file" 2>/dev/null || true
+        case "$cmd0" in
+            "$PROCESS_NAME"|*/"$PROCESS_NAME") pids="${pids}${pids:+ }${pid}" ;;
+        esac
+    done
+    echo "$pids"
+}
+
+# 変換中タスクの後始末をさせるため、まずSIGTERMで穏当な終了を待つ
 echo "${PROCESS_NAME} プロセスを終了しています..."
-pkill -9 -f "$PROCESS_NAME" || true
+server_pids="$(find_server_pids)"
+
+if [ -z "$server_pids" ]; then
+    echo "  -> 起動中のプロセスはありません。"
+else
+    echo "  -> 停止を要求します (PID: ${server_pids})"
+    # shellcheck disable=SC2086
+    kill -TERM $server_pids 2>/dev/null || true
+
+    for _ in $(seq 1 "$SHUTDOWN_TIMEOUT_SEC"); do
+        server_pids="$(find_server_pids)"
+        if [ -z "$server_pids" ]; then break; fi
+        sleep 1
+        printf "."
+    done
+
+    if [ -n "$server_pids" ]; then
+        echo
+        echo "警告: ${SHUTDOWN_TIMEOUT_SEC}秒以内に終了しなかったため強制終了します (PID: ${server_pids})" >&2
+        # shellcheck disable=SC2086
+        kill -KILL $server_pids 2>/dev/null || true
+        sleep 1
+    else
+        echo "  -> 停止しました。"
+    fi
+fi
 
 # フォルダ内に上書きで展開
 echo "アーカイブを展開しています..."
