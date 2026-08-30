@@ -1105,12 +1105,40 @@ class Mp4UploadPipeline(BasePipeline):
             return False
 
     def _mkdir_p(self, remote_dir):
-        if remote_dir in ['/', '.']: return
-        try: self.sftp.stat(remote_dir)
-        except FileNotFoundError:
-            self._mkdir_p(posixpath.dirname(remote_dir))
-            try: self.sftp.mkdir(remote_dir)
-            except OSError: pass
+        """リモート側のディレクトリを、必要な親も含めて作成する。
+
+        再帰で親をたどると、dest_dir が相対パスの場合に
+        posixpath.dirname('tv_program') が '' を返し続けて無限再帰になる。
+        作成が必要な範囲を先に洗い出してから、親→子の順に作成する。
+        """
+        if not remote_dir or remote_dir in ('/', '.'): return
+
+        missing = []
+        current = remote_dir
+        while current and current not in ('/', '.'):
+            try:
+                self.sftp.stat(current)
+                break                      # ここから上は存在するので確認を打ち切る
+            except FileNotFoundError:
+                missing.append(current)
+            except Exception as e:
+                logging.warning(f"  [NAS] ディレクトリを確認できません: {current} ({e})")
+                return
+
+            parent = posixpath.dirname(current)
+            if parent == current: break    # '//' など、これ以上さかのぼれない場合
+            current = parent
+
+        for d in reversed(missing):
+            try:
+                self.sftp.mkdir(d)
+            except Exception as e:
+                # 他の経路が先に作成済みの場合もあるため、存在すれば成功として扱う
+                try:
+                    self.sftp.stat(d)
+                except Exception:
+                    logging.warning(f"  [NAS] ディレクトリを作成できません: {d} ({e})")
+                    return
 
 
 class TsBackupPipeline(BasePipeline):
