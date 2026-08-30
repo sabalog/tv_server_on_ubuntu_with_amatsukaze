@@ -266,9 +266,20 @@ class StateManager:
 
     def _load(self):
         if self.ini_path.exists():
+            # ConfigParser.read() は開けないファイルを黙って無視してしまうため、
+            # 明示的に open() して read_file() で読む（権限エラー等を検知するため）
             try:
-                self.config.read(self.ini_path, encoding='utf-8')
-            except Exception: pass
+                with open(self.ini_path, encoding='utf-8') as f:
+                    self.config.read_file(f)
+            except Exception as e:
+                # 状態ファイルが読めない場合に空の状態で続行すると、処理済みの
+                # 全ファイルを再変換・再転送してしまい被害が大きい。
+                # 破損ファイルは上書きせずに残したまま中断し、運用者の判断を仰ぐ。
+                raise RuntimeError(
+                    f"状態ファイルの読み込みに失敗しました: {self.ini_path} ({e}) / "
+                    f"破損している可能性があります。内容を確認し、退避または削除してから再実行してください"
+                ) from e
+
         for sec in [self.SECTION_COPY_HDD, self.SECTION_CONVERT, self.SECTION_UPLOAD_NAS]:
             if sec not in self.config: self.config[sec] = {}
 
@@ -296,11 +307,38 @@ class StateManager:
                 for k, v in items: sec_data[k] = v
             else:
                 sec_data[file_name] = str(file_size)
-            
-            with open(self.ini_path, 'w', encoding='utf-8') as f:
-                self.config.write(f)
+
+            self._save()
         except Exception as e:
             logging.error(f"INI Update Failed: {e}")
+
+    def _save(self):
+        """一時ファイルへ書き出してから置き換える（アトミック更新）。
+
+        直接上書きしていると、書き込み中に電源断やkillが発生した場合に
+        状態ファイルが中途半端な内容になり、次回起動時に状態を全て失って
+        全ファイルの再変換・再転送を引き起こす。
+        """
+        tmp_path = self.ini_path.with_name(f"{self.ini_path.name}.tmp.{os.getpid()}")
+        try:
+            with open(tmp_path, 'w', encoding='utf-8') as f:
+                self.config.write(f)
+                f.flush()
+                os.fsync(f.fileno())
+
+            os.replace(tmp_path, self.ini_path)
+
+            # rename 自体を永続化する（ディレクトリのfsync。Linux以外では失敗するので無視）
+            try:
+                dir_fd = os.open(str(self.ini_path.parent), os.O_RDONLY)
+                try: os.fsync(dir_fd)
+                finally: os.close(dir_fd)
+            except OSError: pass
+        finally:
+            # 置き換えに失敗した場合、書きかけの一時ファイルを残さない
+            if tmp_path.exists():
+                try: tmp_path.unlink()
+                except OSError: pass
 
 # =========================================================
 # 3. ディスク操作の抽象化 (Disk Operations & Cleaner)
