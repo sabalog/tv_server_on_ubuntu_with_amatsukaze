@@ -28,6 +28,9 @@ DEFAULT_CLI_PATH = "/home/tv-recorder/Amatsukaze/Amatsukaze/exe_files/Amatsukaze
 DEFAULT_SERVER_IP = "localhost"
 DEFAULT_PROFILE = "QsvEnc"
 
+# AddTask はタスク登録のみなので短くてよい
+CLI_TIMEOUT_SEC = 60
+
 
 @contextmanager
 def exclusive_lock(lock_path):
@@ -66,16 +69,23 @@ def get_candidate_files(base_dirs):
         print(f"Searching for files in {base_dir} ...")
         for ts_path in base_dir.rglob("*.ts"):
             avs_path = ts_path.with_name(ts_path.name + ".trim.avs")
-            
-            if avs_path.exists():
+
+            # 走査中に録画ソフトが削除することがあるため、1件の失敗で
+            # スクリプト全体を止めない
+            try:
+                if not avs_path.exists():
+                    continue
                 ts_stat = ts_path.stat()
                 avs_stat = avs_path.stat()
+            except OSError as e:
+                print(f"  Warning: 情報を取得できないためスキップします -> {ts_path} ({e})")
+                continue
 
-                if abs(ts_stat.st_mtime - avs_stat.st_mtime) > 1.0:
-                    candidates.append({
-                        "path": ts_path,
-                        "avs_mtime": avs_stat.st_mtime
-                    })
+            if abs(ts_stat.st_mtime - avs_stat.st_mtime) > 1.0:
+                candidates.append({
+                    "path": ts_path,
+                    "avs_mtime": avs_stat.st_mtime
+                })
 
     candidates.sort(key=lambda x: x["avs_mtime"])
     return candidates
@@ -178,54 +188,76 @@ def convert_single_file(input_file_path, cli_path, server_ip, profile):
             print(f"  [DryRun] Would run: {cmd_str}")
             sync_avs_timestamp(input_path)
         else:
-            subprocess.run(cmd, check=True)
+            # 応答が返らないまま止まるとロックを握ったままになるため上限を設ける
+            subprocess.run(cmd, check=True, timeout=CLI_TIMEOUT_SEC)
             print("  -> Success: タスク登録完了")
             sync_avs_timestamp(input_path)
 
+    except subprocess.TimeoutExpired:
+        print(f"  -> Error: コマンドが{CLI_TIMEOUT_SEC}秒応答しないため中断しました ({cli_path})")
     except subprocess.CalledProcessError as e:
         print(f"  -> Error: コマンド実行失敗 (Code: {e.returncode})")
     except Exception as e:
         print(f"  -> Error: {e}")
 
 def parse_user_selection(user_input, max_len):
+    """選択入力を解釈する。戻り値は (選択されたindexのリスト, 解釈できなかった入力のリスト)。
+
+    誤入力を黙って切り捨てると、利用者が意図したものと違う対象を削除・再変換して
+    しまうため、解釈できなかった要素も返して呼び出し側が中止できるようにする。
+    範囲外の番号も「打ち間違い」とみなして誤入力として扱う。
+    """
     if user_input.lower() == 'a':
-        return list(range(max_len))
+        return list(range(max_len)), []
 
     selected = set()
-    parts = user_input.split(",")
-    
-    for part in parts:
+    invalid = []
+
+    for part in user_input.split(","):
         part = part.strip()
         if not part:
             continue
-        
+
         if "-" in part:
+            range_parts = part.split("-")
             try:
-                range_parts = part.split("-")
-                if len(range_parts) == 2:
-                    start = int(range_parts[0])
-                    end = int(range_parts[1])
-                    s, e = min(start, end), max(start, end)
-                    
-                    for i in range(s, e + 1):
-                        if 1 <= i <= max_len:
-                            selected.add(i - 1)
+                if len(range_parts) != 2:
+                    raise ValueError
+                start, end = int(range_parts[0]), int(range_parts[1])
             except ValueError:
-                pass
+                invalid.append(part)
+                continue
+
+            s, e = min(start, end), max(start, end)
+            if s < 1 or e > max_len:
+                invalid.append(part)
+                continue
+            selected.update(range(s - 1, e))
         else:
             try:
                 idx = int(part)
-                if 1 <= idx <= max_len:
-                    selected.add(idx - 1)
             except ValueError:
-                pass
+                invalid.append(part)
+                continue
+
+            if not (1 <= idx <= max_len):
+                invalid.append(part)
+                continue
+            selected.add(idx - 1)
                 
-    return sorted(list(selected))
+    return sorted(list(selected)), invalid
 
 def main():
+    global DRY_RUN_MODE
+
     parser = argparse.ArgumentParser(description="Amatsukaze Interactive Converter")
     parser.add_argument("-a", "--all", action="store_true", help="確認なしですべての候補を変換します")
+    parser.add_argument("-n", "--dry-run", action="store_true",
+                        help="実際には変更せず、行われる操作のみ表示します")
     args = parser.parse_args()
+
+    if args.dry_run:
+        DRY_RUN_MODE = True
 
     candidates = get_candidate_files(ORIGINAL_BASES)
 
@@ -245,13 +277,29 @@ def main():
         selected_indices = list(range(len(candidates)))
     else:
         print(f"選択肢: 番号(1-{len(candidates)}), 全選択(a)")
-        user_input = input(f"変換対象を選択 > ").strip()
+        try:
+            user_input = input("変換対象を選択 > ").strip()
+        except EOFError:
+            print("\n入力がありません。終了します。")
+            return
+        except KeyboardInterrupt:
+            print("\n中止しました。")
+            sys.exit(130)
 
         if not user_input:
             print("選択なし。終了します。")
             return
 
-        selected_indices = parse_user_selection(user_input, len(candidates))
+        selected_indices, invalid = parse_user_selection(user_input, len(candidates))
+
+        # 一部だけ解釈できた状態で実行すると、意図しない対象を削除・再変換して
+        # しまうため、誤入力があれば何もせずに終了する
+        if invalid:
+            print(f"[Error] 解釈できない入力があります: {', '.join(invalid)}")
+            print(f"        1-{len(candidates)} の番号、範囲(例: 1-3)、カンマ区切り、"
+                  f"全選択(a) のいずれかで指定してください。")
+            print("        安全のため何も実行せずに終了します。")
+            sys.exit(1)
 
     if not selected_indices:
         print("有効な番号が選択されませんでした。")
