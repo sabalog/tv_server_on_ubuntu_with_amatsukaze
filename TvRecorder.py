@@ -63,6 +63,37 @@ def format_bytes(size: int) -> str:
 def normalize_str(s: str) -> str:
     return unicodedata.normalize('NFC', s) if isinstance(s, str) else s
 
+def check_mounted(path: Path) -> Tuple[bool, str]:
+    """path が（ルートFSとは別の）マウント済みボリューム上にあるかを判定する。
+
+    設定値はマウントポイント直下ではなくその配下のことがあるため
+    (例: /mnt/hdd/ts_files)、os.path.ismount() ではなくデバイスIDを比較する。
+    マウントが外れている場合、マウントポイントの空ディレクトリはルートFSに
+    属するので、ルートと同じデバイスIDになることで検出できる。
+
+    未作成のディレクトリ（マウント後に mkdir する想定のもの）も許容するため、
+    存在する最も近い親までさかのぼって判定する。
+    """
+    try:
+        root_dev = os.stat('/').st_dev
+    except OSError as e:
+        return False, f"ルートFSの情報を取得できません ({e})"
+
+    target = path
+    while not target.exists():
+        parent = target.parent
+        if parent == target:
+            return False, f"パスが存在しません: {path}"
+        target = parent
+
+    try:
+        if target.stat().st_dev == root_dev:
+            return False, f"マウントされていません(ルートFS上にあります): {path}"
+    except OSError as e:
+        return False, f"マウント状態を確認できません: {path} ({e})"
+
+    return True, ""
+
 # Amatsukaze が出力するファイル名の、元ファイル名に続く部分のパターン
 #   ""       : 番組名.mp4        (通常の出力)
 #   "-1"     : 番組名-1.mp4      (CM分割などによる分割出力)
@@ -103,6 +134,12 @@ class Config:
     write_log: bool = False
     scan_threshold_sec: int = 10
     ts_delete_days: int = 30
+
+    # 各ディレクトリがマウント済みかを確認してから処理する。
+    # マウントが外れているとマウントポイントの空ディレクトリがルートFS上に見えるため、
+    # 気付かずにシステムディスクへコピーしたり、容量0と誤認して掃除処理が
+    # 誤動作したりする。すべて同一FS上で運用する場合は False にする。
+    verify_mount: bool = True
 
     # --- HDDコピー実行許可時間帯 ---
     copy_window_start_hour: int = 3
@@ -532,6 +569,19 @@ class BasePipeline(ABC):
     def run(self):
         pass
 
+    def _verify_mounts(self, phase_label: str, *dirs: Path) -> bool:
+        """処理対象がマウント済みか確認する。1つでもNGならフェーズごとスキップする。"""
+        if not self.cfg.verify_mount: return True
+
+        for d in dirs:
+            ok, reason = check_mounted(d)
+            if not ok:
+                self.cfg.write_log = True
+                activate_realtime_log()
+                logging.error(f"[Mount] {reason} -> {phase_label} をスキップします")
+                return False
+        return True
+
     def _cleanup_empty_dirs_local(self, root: Path, excludes: List[str] = None):
         if not root.exists(): return
         excludes = excludes or []
@@ -559,6 +609,8 @@ class TsConverterPipeline(BasePipeline):
     """Phase 1: TS -> MP4 変換"""
     
     def run(self):
+        if not self._verify_mounts("Phase 1", self.cfg.source_dir_ts, self.cfg.converted_dir): return
+
         tasks = list(self._scan())
         self._cleanup()
 
@@ -656,8 +708,9 @@ class Mp4UploadPipeline(BasePipeline):
         self.transport = None
 
     def run(self):
+        if not self._verify_mounts("Phase 2", self.cfg.converted_dir): return
         if not self.cfg.converted_dir.exists(): return
-        
+
         candidates = list(self._scan_candidates())
         if not candidates: return
 
@@ -827,29 +880,33 @@ class TsBackupPipeline(BasePipeline):
     """Phase 3: TS -> HDD バックアップ"""
 
     def run(self):
+        if not self._verify_mounts("Phase 3", self.cfg.source_dir_ts): return
+
         # Phase 3 は負荷が高いため、指定の時間帯のみ実行する
         if not self.cfg.is_hdd_copy_time_window and not self.cfg.dry_run: return
 
-        tasks = list(self._scan())
-        self._cleanup()
+        # コピー先のHDDが外れている場合はコピーのみ見送り、後段の残存TS回収は行う
+        if self._verify_mounts("Phase 3のHDDコピー", self.cfg.dest_dir_hdd):
+            tasks = list(self._scan())
+            self._cleanup()
 
-        if tasks:
-            self.cfg.write_log = True
-            activate_realtime_log()
-            
-            dest_path = self.cfg.dest_dir_hdd
-            pre_size_str = self._get_dir_size_str(dest_path)
-            logging.info("=== Phase 3: TSバックアップ (Backup) ===")
-            logging.info(f"コピー対象数: {len(tasks)} (現在のディレクトリサイズ [{dest_path}]: {pre_size_str})")
-            for task in tasks:
-                self._process(task)
+            if tasks:
+                self.cfg.write_log = True
+                activate_realtime_log()
 
-            post_size_str = self._get_dir_size_str(dest_path)
-            logging.info(f"バックアップ完了後のディレクトリサイズ [{dest_path}]: {post_size_str}")
+                dest_path = self.cfg.dest_dir_hdd
+                pre_size_str = self._get_dir_size_str(dest_path)
+                logging.info("=== Phase 3: TSバックアップ (Backup) ===")
+                logging.info(f"コピー対象数: {len(tasks)} (現在のディレクトリサイズ [{dest_path}]: {pre_size_str})")
+                for task in tasks:
+                    self._process(task)
 
-        # 残存TSの回収はフェイルセーフのため、コピー対象の有無に関わらず実行する。
-        # （コピー対象があった場合は、そのコピーが終わってから実行されるよう、
-        #   この位置に置いている）
+                post_size_str = self._get_dir_size_str(dest_path)
+                logging.info(f"バックアップ完了後のディレクトリサイズ [{dest_path}]: {post_size_str}")
+
+        # 残存TSの回収はフェイルセーフのため、コピー対象の有無やHDDのマウント状態に
+        # 関わらず実行する。（コピー対象があった場合は、そのコピーが終わってから
+        # 実行されるよう、この位置に置いている）
         self.cleaner.delete_old_files_by_pattern(self.cfg.source_dir_ts, self.cfg.ts_delete_days, "*.ts")
 
     def _get_dir_size_str(self, target_path: Path) -> str:
