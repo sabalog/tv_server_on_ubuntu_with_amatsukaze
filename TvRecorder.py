@@ -827,6 +827,7 @@ class TsBackupPipeline(BasePipeline):
     """Phase 3: TS -> HDD バックアップ"""
 
     def run(self):
+        # Phase 3 は負荷が高いため、指定の時間帯のみ実行する
         if not self.cfg.is_hdd_copy_time_window and not self.cfg.dry_run: return
 
         tasks = list(self._scan())
@@ -842,11 +843,14 @@ class TsBackupPipeline(BasePipeline):
             logging.info(f"コピー対象数: {len(tasks)} (現在のディレクトリサイズ [{dest_path}]: {pre_size_str})")
             for task in tasks:
                 self._process(task)
-            
-            self.cleaner.delete_old_files_by_pattern(self.cfg.source_dir_ts, self.cfg.ts_delete_days, "*.ts")
-            
+
             post_size_str = self._get_dir_size_str(dest_path)
             logging.info(f"バックアップ完了後のディレクトリサイズ [{dest_path}]: {post_size_str}")
+
+        # 残存TSの回収はフェイルセーフのため、コピー対象の有無に関わらず実行する。
+        # （コピー対象があった場合は、そのコピーが終わってから実行されるよう、
+        #   この位置に置いている）
+        self.cleaner.delete_old_files_by_pattern(self.cfg.source_dir_ts, self.cfg.ts_delete_days, "*.ts")
 
     def _get_dir_size_str(self, target_path: Path) -> str:
         if not target_path.exists():
