@@ -18,8 +18,12 @@ Ubuntu 上の TV 録画サーバ（EPGStation + Amatsukaze）を運用するた�
 ## 実行環境と開発環境
 
 **実行環境は Ubuntu 専用**。`fcntl`（排他ロック）、`os.stat('/').st_dev`（マウント判定）、
-`/mnt/...` の絶対パスに依存している。設定値は `Config` dataclass にハードコードされており、
-設定ファイルは無い。
+`/mnt/...` の絶対パスに依存している。設定値は `Config` dataclass に書かれている。
+
+例外は NAS の認証情報で、これだけは外部ファイル
+（既定 `/home/tv-recorder/Scripts/nas_TvRecorder.conf`、書式は `nas_TvRecorder.conf.sample`）
+へ分離している。リポジトリが公開されているため、パスワードをソースへ書けないという理由。
+ファイルが無ければ `Config.nas_config` の値がそのまま使われる。
 
 開発が Windows 上で行われる場合、`TvRecorder.py` はそのままでは import できない
 （`fcntl` が無い、`paramiko` が未インストール）。ロジック検証には下記のスタブが必要。

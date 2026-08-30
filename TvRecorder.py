@@ -95,6 +95,59 @@ def check_mounted(path: Path) -> Tuple[bool, str]:
 
     return True, ""
 
+NAS_CONFIG_SECTION = 'NAS'
+NAS_CONFIG_KEYS = ('host', 'user', 'password', 'key_file', 'dest_dir')
+
+def load_nas_config(path: Path, defaults: Dict) -> Dict:
+    """NAS接続設定を外部ファイルから読み込み、既定値へ上書きしたものを返す。
+
+    ファイルが存在しない場合は既定値をそのまま返す（鍵認証のみで運用する場合や、
+    設定を分離していない既存環境でも動作させるため）。
+    書式は以下のとおり。空値を書いた項目は未設定 (None) として扱う。
+
+        [NAS]
+        host = 192.168.1.2
+        port = 22
+        user = tv-recorder
+        password = xxxxxxxx
+        key_file =
+        dest_dir = /tv_program/converted_files
+    """
+    merged = dict(defaults)
+    if not path.exists():
+        return merged
+
+    try:
+        # 他ユーザーから読める状態なら、分離した意味が薄れるため警告する
+        if path.stat().st_mode & (stat.S_IRWXG | stat.S_IRWXO):
+            logging.warning(f"NAS設定ファイルが他ユーザーから読める状態です: {path} (chmod 600 を推奨)")
+    except OSError:
+        pass
+
+    # interpolation=None: パスワードに % が含まれていても壊さない
+    parser = configparser.ConfigParser(interpolation=None)
+    try:
+        with open(path, encoding='utf-8') as f:
+            parser.read_file(f)
+    except Exception as e:
+        raise RuntimeError(f"NAS設定ファイルを読み込めません: {path} ({e})") from e
+
+    if not parser.has_section(NAS_CONFIG_SECTION):
+        raise RuntimeError(f"NAS設定ファイルに [{NAS_CONFIG_SECTION}] セクションがありません: {path}")
+
+    section = parser[NAS_CONFIG_SECTION]
+    for key in NAS_CONFIG_KEYS:
+        if key in section:
+            merged[key] = section[key] or None
+
+    if 'port' in section:
+        try:
+            merged['port'] = int(section['port'])
+        except ValueError as e:
+            raise RuntimeError(f"NAS設定ファイルの port が数値ではありません: {section['port']!r}") from e
+
+    return merged
+
 # Amatsukaze が出力するファイル名の、元ファイル名に続く部分のパターン
 #   ""       : 番組名.mp4        (通常の出力)
 #   "-1"     : 番組名-1.mp4      (CM分割などによる分割出力)
@@ -153,12 +206,16 @@ class Config:
     sftp_io_timeout_sec: int = 300      # 転送中の1回の読み書き（ファイル全体ではない）
 
     # --- NAS接続設定 ---
+    # パスワードをこのファイルに書くと、リポジトリへ載せた時点で公開されてしまう。
+    # 認証情報は下記の外部ファイル (chmod 600) へ分離し、ここには既定値だけを置く。
+    # 外部ファイルが無い場合は、ここの値がそのまま使われる。
+    nas_config_file: Path = Path("/home/tv-recorder/Scripts/nas_TvRecorder.conf")
     nas_config: Dict = field(default_factory=lambda: {
         'host': '192.168.1.2',
         'port': 22,
         'user': 'tv-recorder',
-        'password': '********',
-        'key_file': None,
+        'password': None,   # nas_TvRecorder.conf に記載する
+        'key_file': None,   # 鍵認証を使う場合はこちら（パスワードより安全）
         'dest_dir': '/tv_program/converted_files'
     })
 
@@ -945,6 +1002,11 @@ class Mp4UploadPipeline(BasePipeline):
 
     def _connect_sftp(self):
         c = self.cfg.nas_config
+        if not c.get('key_file') and not c.get('password'):
+            logging.error(f"[NAS] 認証情報が設定されていません。"
+                          f"{self.cfg.nas_config_file} に password または key_file を指定してください")
+            return None, None
+
         t = None
         try:
             # Transportにホスト名を渡すとOS既定(数分)まで待つため、接続は自前で行う
@@ -1435,6 +1497,7 @@ def main() -> int:
 
     failures = []
     try:
+        cfg.nas_config = load_nas_config(cfg.nas_config_file, cfg.nas_config)
         state = StateManager(cfg.ini_file)
         mode = "DryRun" if cfg.dry_run else "Production"
 
