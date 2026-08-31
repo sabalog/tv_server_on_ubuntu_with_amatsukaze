@@ -174,3 +174,11 @@ SFTP を伴う経路は、`listdir_attr` / `stat` / `put` / `rmdir` を持つ偽
 - 外部コマンドや SFTP を呼ぶ箇所には必ずタイムアウトを設ける。応答が返らないまま
   停止すると flock を握ったままになり、以降の cron 実行が全て無言でスキップされる。
 - コミットメッセージは日本語で、「何が問題だったか → なぜそう直したか」を書く運用。
+- **コミットの author / committer は `sabalog <webmaster@sabalog.com>` に統一する**。
+  グローバル設定が別の ID になっている環境があるため、コミット前に必ず確認すること。
+
+  ```bash
+  git config user.name  "sabalog"
+  git config user.email "webmaster@sabalog.com"   # リポジトリローカルに設定する
+  git log -1 --pretty='%an <%ae> / %cn <%ce>'     # コミット後の確認
+  ```
