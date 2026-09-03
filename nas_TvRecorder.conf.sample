@@ -1,0 +1,25 @@
+# NAS接続設定のサンプル
+#
+# このファイルを nas_TvRecorder.conf という名前でコピーし、
+# TvRecorder.py の Config.nas_config_file が指す場所へ置いてください。
+# （既定: /home/tv-recorder/Scripts/nas_TvRecorder.conf）
+#
+# 認証情報を含むため、必ず本人のみ読める状態にしてください。
+#     chmod 600 nas_TvRecorder.conf
+#
+# 記載した項目だけが TvRecorder.py 側の既定値を上書きします。
+# 空にした項目は「未設定」として扱われます。
+
+[NAS]
+host = 192.168.1.2
+port = 22
+user = tv-recorder
+
+# パスワード認証を使う場合はこちら
+password = 
+
+# 鍵認証を使う場合はこちら（パスワードより安全なので推奨）
+# password は空のままにしてください
+key_file = 
+
+dest_dir = /tv_program/converted_files

@@ -220,3 +220,6 @@ __marimo__/
 *.ini
 *.log
 *.lock
+
+# TvRecorder の NAS 認証情報（サンプルのみ管理する）
+nas_TvRecorder.conf
