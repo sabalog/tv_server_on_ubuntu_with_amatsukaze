@@ -1,5 +1,22 @@
 #!/bin/bash
 
+# エラー検知の設定
+#   -e          : コマンドが失敗した時点で即座に中断する
+#   -u          : 未定義変数の参照をエラーにする
+#   -o pipefail : パイプライン中のいずれかが失敗したら全体を失敗扱いにする
+#                 （tar | xz のように「前段の失敗」を見逃さないために必須）
+set -euo pipefail
+
+# 個別のメッセージを持たないコマンドが set -e で中断した場合でも、
+# どこで何が失敗したのか分かるようにする（無言終了の防止）
+trap 'echo "エラー: 処理を中断しました ($(basename "${BASH_SOURCE[0]}") ${LINENO}行目: ${BASH_COMMAND})" >&2' ERR
+
+# エラーメッセージを表示して終了する
+die() {
+    echo "エラー: $1" >&2
+    exit 1
+}
+
 # ==============================================================================
 # 環境設定 (必要に応じて変更してください)
 # ==============================================================================
@@ -13,7 +30,10 @@ TARGET_DIR="${HOME}/Amatsukaze/Amatsukaze"
 
 # バックアップファイルの保存先ディレクトリとファイル名
 BACKUP_DIR="${HOME}/Amatsukaze/Download"
-BACKUP_FILENAME="Amatsukaze_backup_$(date +%Y%m%d).tar.xz"
+# 同日に複数回実行しても上書きしないよう、時刻まで名前に含める。
+# （日付だけだと、更新に失敗して再実行した際に、直前の正常な状態のバックアップを
+#   「更新後の壊れた状態」で上書きしてしまう）
+BACKUP_FILENAME="Amatsukaze_backup_$(date +%Y%m%d_%H%M%S).tar.xz"
 
 # ダウンロードファイル名のプレフィックス（OS環境等に合わせて変更）
 FILE_PREFIX="Amatsukaze_Ubuntu24.04_"
@@ -31,12 +51,31 @@ PORT=32768
 # プロセス名および実行ファイル名
 PROCESS_NAME="AmatsukazeServerCLI"
 
+# サーバの標準出力・標準エラーの記録先（起動失敗の原因調査に使う）
+SERVER_LOG="${TARGET_DIR}/${PROCESS_NAME}.log"
+
+# 起動確認のタイムアウト（秒）
+STARTUP_TIMEOUT_SEC=30
+
+# 停止時に送るシグナルと、応答を待つ時間（秒）。
+#
+# 実機の AmatsukazeServerCLI は SIGINT にも SIGTERM にも応答しない
+# （上流にハンドラは実装されているが機能していない。停止用のCLIコマンドも無い）。
+# 待っても無駄なので、作法として SIGINT を送って短時間だけ待ち、応答が無ければ
+# SIGKILL する。将来のバージョンで応答するようになれば、そちらが使われる。
+#
+# サーバは停止時に特別な後始末をしない（EndServer() はメッセージループを
+# 終わらせるだけ）ため、強制終了の影響はエンコード中断時の一時ファイル程度。
+STOP_SIGNAL="INT"
+STOP_WAIT_SEC=3
+
 # ==============================================================================
 
-# 引数が指定されているかチェック
-if [ -z "$1" ]; then
-    echo "エラー: 第1引数にバージョン（例: 0.9.5.4）を指定してください。"
-    echo "使用法: $0 <Version> [ダウンロード先ディレクトリ(省略可)]"
+# 引数が指定されているかチェック（set -u 環境では ${1:-} と書かないとエラーになる）
+if [ -z "${1:-}" ]; then
+    echo "エラー: 第1引数にバージョン（例: 0.9.5.4）を指定してください。" >&2
+    echo "使用法: $0 <Version> [ダウンロード先ディレクトリ(省略可)]" >&2
+    echo "        EXPECTED_SHA256=<hash> を指定すると、ダウンロードしたファイルを照合します。" >&2
     exit 1
 fi
 
@@ -48,28 +87,61 @@ DOWNLOAD_URL="${GITHUB_RELEASES_URL}/${VERSION}/${FILENAME}"
 
 # スクリプトが配置されているディレクトリを取得し、カレントディレクトリにする
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR" || exit 1
+cd "$SCRIPT_DIR" || die "スクリプトのディレクトリへ移動できません: ${SCRIPT_DIR}"
 
 # ==============================================================================
 # 1. 既存フォルダのバックアップ
 # ==============================================================================
+# 作成したバックアップのパス（未作成なら空文字）。展開失敗時の案内で参照する
+BACKUP_FILE=""
+
 # 既存の対象ディレクトリが存在する場合、確認プロンプトを表示
 if [ -d "$TARGET_DIR" ]; then
-    read -p "既存の ${PROCESS_NAME} フォルダをバックアップしますか？ (y/N): " yn
+    # 非対話実行（cron/パイプ等）では read が EOF で失敗するため、|| true で中断を防ぐ
+    yn=""
+    read -p "既存の ${PROCESS_NAME} フォルダをバックアップしますか？ (y/N): " yn || true
     case "$yn" in
         [yY]*)
             # バックアップ保存先ディレクトリが存在しない場合は作成
-            mkdir -p "$BACKUP_DIR"
+            mkdir -p "$BACKUP_DIR" \
+                || die "バックアップ先ディレクトリを作成できません: ${BACKUP_DIR}"
             # 出力先を絶対パスに変換（コマンド実行時のパスズレを防ぐため）
-            BACKUP_DIR_ABS="$(cd "$BACKUP_DIR" && pwd)"
+            BACKUP_DIR_ABS="$(cd "$BACKUP_DIR" && pwd)" \
+                || die "バックアップ先ディレクトリへ移動できません: ${BACKUP_DIR}"
             BACKUP_FILE="${BACKUP_DIR_ABS}/${BACKUP_FILENAME}"
-            
+            # 一時ファイルに書き出してから差し替える
+            # （途中で失敗した場合に、既存の同名バックアップを壊さないため）
+            BACKUP_TMP="${BACKUP_FILE}.tmp.$$"
+
             echo "既存のフォルダをバックアップしています (${BACKUP_FILE})..."
-            
+
             # TARGET_DIRの親ディレクトリと、ディレクトリ名本体を動的に取得して圧縮
             TARGET_PARENT="$(dirname "$TARGET_DIR")"
             TARGET_BASENAME="$(basename "$TARGET_DIR")"
-            tar -c -C "$TARGET_PARENT" "$TARGET_BASENAME" | xz -v > "$BACKUP_FILE"
+
+            # pipefail により tar / xz のどちらが失敗しても検知できる
+            # （ディスク満杯・読み取り不可などでバックアップが不完全なまま
+            #   後続のプロセス停止・上書き展開へ進むと復旧不能になるため、ここで必ず中断する）
+            if ! tar -c -C "$TARGET_PARENT" "$TARGET_BASENAME" | xz -v > "$BACKUP_TMP"; then
+                echo "エラー: バックアップの作成に失敗しました (${BACKUP_TMP})。" >&2
+                echo "       ディスクの空き容量やファイルの読み取り権限を確認してください。" >&2
+                echo "       安全のため、更新処理を中止します。" >&2
+                rm -f "$BACKUP_TMP"
+                exit 1
+            fi
+
+            mv -f "$BACKUP_TMP" "$BACKUP_FILE" \
+                || die "バックアップファイルを配置できません: ${BACKUP_FILE}"
+            echo "バックアップが完了しました: ${BACKUP_FILE} ($(du -h "$BACKUP_FILE" | cut -f1))"
+
+            # 古いバックアップは自動削除しない（どれが必要かは利用者にしか分からない）。
+            # ただし溜まっていることに気付けるよう、件数と合計サイズを知らせる。
+            backup_count="$(find "$BACKUP_DIR_ABS" -maxdepth 1 -type f -name "Amatsukaze_backup_*.tar.xz" 2>/dev/null | wc -l | tr -d "[:space:]")"
+            if [ "${backup_count:-0}" -gt 1 ]; then
+                backup_total="$(du -ch "$BACKUP_DIR_ABS"/Amatsukaze_backup_*.tar.xz 2>/dev/null | tail -n 1 | cut -f1)"
+                echo "  -> バックアップが ${backup_count} 個 (合計 ${backup_total}) あります: ${BACKUP_DIR_ABS}"
+                echo "     不要なものは手動で削除してください。"
+            fi
             ;;
         *)
             echo "バックアップをスキップしました。"
@@ -83,10 +155,12 @@ fi
 # 2. ダウンロード処理
 # ==============================================================================
 # ダウンロード先ディレクトリが存在しない場合は作成
-mkdir -p "$DOWNLOAD_DIR"
+mkdir -p "$DOWNLOAD_DIR" \
+    || die "ダウンロード先ディレクトリを作成できません: ${DOWNLOAD_DIR}"
 
 # ダウンロード先ディレクトリを絶対パスに変換（展開時のパスズレを防ぐため）
-DOWNLOAD_DIR_ABS="$(cd "$DOWNLOAD_DIR" && pwd)"
+DOWNLOAD_DIR_ABS="$(cd "$DOWNLOAD_DIR" && pwd)" \
+    || die "ダウンロード先ディレクトリへ移動できません: ${DOWNLOAD_DIR}"
 DOWNLOAD_PATH="${DOWNLOAD_DIR_ABS}/${FILENAME}"
 
 echo "${PROCESS_NAME} バージョン ${VERSION} をダウンロードしています..."
@@ -98,24 +172,195 @@ if ! curl -f -L -o "$DOWNLOAD_PATH" "$DOWNLOAD_URL"; then
     exit 1
 fi
 
+# ------------------------------------------------------------------------------
+# ダウンロードしたファイルの検証
+#
+# サーバを停止して上書きする前にここで弾く。展開時に破損へ気付いても、その時点では
+# 既に元の環境を壊しているため手遅れになる。
+# 配布元がチェックサムを公開していないため、既定では書庫自体の整合性を確認する。
+# xz はブロックごとにCRCを持つので、途中で切れた・化けたファイルはこれで分かる。
+# ------------------------------------------------------------------------------
+echo "ダウンロードしたファイルを検証しています..."
+
+if ! xz -t "$DOWNLOAD_PATH"; then
+    echo "エラー: ダウンロードしたファイルが壊れています: ${DOWNLOAD_PATH}" >&2
+    echo "       ネットワークやディスクの空き容量を確認して再実行してください。" >&2
+    echo "       破損したファイルは削除します。" >&2
+    rm -f "$DOWNLOAD_PATH"
+    exit 1
+fi
+
+# 入手経路の正しさまで確認したい場合は、期待するSHA-256を環境変数で渡す
+if [ -n "${EXPECTED_SHA256:-}" ]; then
+    ACTUAL_SHA256="$(sha256sum "$DOWNLOAD_PATH" | cut -d " " -f 1)" || die "sha256sum を実行できません"
+    if [ "$ACTUAL_SHA256" != "$EXPECTED_SHA256" ]; then
+        echo "エラー: SHA-256が一致しません。" >&2
+        echo "       期待値: ${EXPECTED_SHA256}" >&2
+        echo "       実際  : ${ACTUAL_SHA256}" >&2
+        echo "       ファイルを削除します。" >&2
+        rm -f "$DOWNLOAD_PATH"
+        exit 1
+    fi
+    echo "  -> SHA-256 一致 (${ACTUAL_SHA256})"
+else
+    echo "  -> 書庫の整合性を確認しました (SHA-256の照合は EXPECTED_SHA256 指定時のみ)"
+fi
+
 # ==============================================================================
 # 3. プロセス停止・展開・再起動
 # ==============================================================================
-# プロセスを全てkill
+# 起動中のサーバのPIDを列挙する。
+#
+# pkill -f はコマンドライン全体と照合するため、ログを開いている
+# `tail -f .../AmatsukazeServerCLI.log` のような無関係なプロセスまで巻き込む。
+# 一方 -f を外すとプロセス名の照合になるが、15文字までしか比較されないため
+# AmatsukazeServerCLI (19文字) では一致しない。
+# そこで argv[0]（起動時に指定された実行ファイル）だけを見て判定する。
+# ログファイル名などは argv[1] 以降に現れるので誤爆しない。
+find_server_pids() {
+    local pids="" cmdline_file pid cmd0
+    for cmdline_file in /proc/[0-9]*/cmdline; do
+        [ -r "$cmdline_file" ] || continue
+        pid="${cmdline_file#/proc/}"
+        pid="${pid%/cmdline}"
+        # bash の read は -d '' で NUL 区切り、つまり argv[0] だけを読み取れる
+        cmd0=""
+        IFS= read -r -d '' cmd0 < "$cmdline_file" 2>/dev/null || true
+        case "$cmd0" in
+            "$PROCESS_NAME"|*/"$PROCESS_NAME") pids="${pids}${pids:+ }${pid}" ;;
+        esac
+    done
+    echo "$pids"
+}
+
+# 変換中タスクの後始末をさせるため、まずSIGTERMで穏当な終了を待つ
 echo "${PROCESS_NAME} プロセスを終了しています..."
-pkill -9 -f "$PROCESS_NAME" || true
+server_pids="$(find_server_pids)"
+
+if [ -z "$server_pids" ]; then
+    echo "  -> 起動中のプロセスはありません。"
+else
+    echo "  -> 停止を要求します (PID: ${server_pids}, SIG${STOP_SIGNAL})"
+    # shellcheck disable=SC2086
+    kill -"$STOP_SIGNAL" $server_pids 2>/dev/null || true
+
+    for _ in $(seq 1 "$STOP_WAIT_SEC"); do
+        server_pids="$(find_server_pids)"
+        if [ -z "$server_pids" ]; then break; fi
+        sleep 1
+    done
+
+    if [ -z "$server_pids" ]; then
+        echo "  -> 停止しました。"
+    else
+        echo "  -> ${STOP_WAIT_SEC}秒待っても応答が無いため強制終了します (PID: ${server_pids})"
+        echo "     エンコード中だった場合、子プロセスや一時ファイルが残ることがあります。"
+        # shellcheck disable=SC2086
+        kill -KILL $server_pids 2>/dev/null || true
+        sleep 1
+
+        # 停止できないまま展開へ進むと、旧サーバが動いたまま実行ファイルを
+        # 置き換えることになるため、ここで必ず確認する
+        server_pids="$(find_server_pids)"
+        if [ -n "$server_pids" ]; then
+            die "プロセスを停止できませんでした (PID: ${server_pids})。手動で停止してから再実行してください。"
+        fi
+        echo "  -> 強制終了しました。"
+    fi
+fi
 
 # フォルダ内に上書きで展開
 echo "アーカイブを展開しています..."
-mkdir -p "$TARGET_DIR"
+mkdir -p "$TARGET_DIR" \
+    || die "展開先ディレクトリを作成できません: ${TARGET_DIR}"
 # ダウンロードした絶対パスを指定して展開
-tar -xf "$DOWNLOAD_PATH" -C "$TARGET_DIR"
+# 展開に失敗した状態（中途半端なファイル構成）でサーバを起動しないよう、ここで中断する
+if ! tar -xf "$DOWNLOAD_PATH" -C "$TARGET_DIR"; then
+    echo "エラー: アーカイブの展開に失敗しました (${DOWNLOAD_PATH})。" >&2
+    echo "       ダウンロードファイルが破損しているか、ディスクの空き容量が不足している可能性があります。" >&2
+    echo "       ${TARGET_DIR} は不完全な状態です。サーバは起動しません。" >&2
+    if [ -n "$BACKUP_FILE" ] && [ -f "$BACKUP_FILE" ]; then
+        echo "       復元する場合: tar -xf \"${BACKUP_FILE}\" -C \"$(dirname "$TARGET_DIR")\"" >&2
+    fi
+    exit 1
+fi
 
 # 展開先に移動
-cd "$TARGET_DIR" || exit 1
+cd "$TARGET_DIR" || die "展開先ディレクトリへ移動できません: ${TARGET_DIR}"
 
-# バックグラウンドで起動
+# ==============================================================================
+# 4. 起動と起動確認
+# ==============================================================================
+EXE_PATH="./exe_files/${PROCESS_NAME}"
+if [ ! -x "$EXE_PATH" ]; then
+    die "実行ファイルが見つからないか実行権限がありません: ${TARGET_DIR}/${EXE_PATH#./}"
+fi
+
 echo "${PROCESS_NAME} をポート ${PORT} で起動します..."
-./exe_files/${PROCESS_NAME} -p "$PORT" &
 
+# nohup + disown で端末から切り離す。
+# これが無いと、SSH を切断した時に SIGHUP でサーバまで終了してしまう。
+# 出力を捨てると起動失敗の原因を追えないため、ログファイルへ追記する。
+nohup "$EXE_PATH" -p "$PORT" >> "$SERVER_LOG" 2>&1 &
+SERVER_PID=$!
+disown "$SERVER_PID" 2>/dev/null || true
+
+# ポートの待ち受けを確認する手段があるか調べる
+port_check_cmd=""
+if command -v ss > /dev/null 2>&1; then
+    port_check_cmd="ss"
+elif command -v netstat > /dev/null 2>&1; then
+    port_check_cmd="netstat"
+fi
+
+is_listening() {
+    case "$port_check_cmd" in
+        ss)      ss -ltn 2>/dev/null | grep -q ":${PORT} " ;;
+        netstat) netstat -ltn 2>/dev/null | grep -q ":${PORT} " ;;
+        *)       return 1 ;;
+    esac
+}
+
+report_failure() {
+    echo "エラー: $1" >&2
+    echo "        ログの末尾を表示します (${SERVER_LOG}):" >&2
+    tail -n 20 "$SERVER_LOG" >&2 || true
+    exit 1
+}
+
+# バックグラウンド起動は成否が終了コードに現れないため、明示的に確認する
+printf "起動を確認しています"
+started=false
+for _ in $(seq 1 "$STARTUP_TIMEOUT_SEC"); do
+    if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+        echo
+        report_failure "${PROCESS_NAME} が起動直後に終了しました。"
+    fi
+
+    if [ -z "$port_check_cmd" ]; then
+        # ss も netstat も無い環境では、プロセスの生存のみを確認する
+        sleep 3
+        echo
+        echo "警告: ポートの確認手段(ss/netstat)が無いため、待ち受け開始は未確認です。" >&2
+        started=true
+        break
+    fi
+
+    if is_listening; then
+        echo
+        started=true
+        break
+    fi
+
+    sleep 1
+    printf "."
+done
+
+if [ "$started" != true ]; then
+    echo
+    report_failure "${STARTUP_TIMEOUT_SEC}秒以内にポート ${PORT} の待ち受けを開始しませんでした。"
+fi
+
+echo "${PROCESS_NAME} が起動しました (PID: ${SERVER_PID}, ポート: ${PORT})"
+echo "ログ: ${SERVER_LOG}"
 echo "処理が完了しました。"
