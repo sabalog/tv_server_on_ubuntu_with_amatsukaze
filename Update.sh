@@ -36,7 +36,8 @@ BACKUP_DIR="${HOME}/Amatsukaze/Download"
 BACKUP_FILENAME="Amatsukaze_backup_$(date +%Y%m%d_%H%M%S).tar.xz"
 
 # ダウンロードファイル名のプレフィックス（OS環境等に合わせて変更）
-FILE_PREFIX="Amatsukaze_Ubuntu24.04_"
+FILE_PREFIX="Amatsukaze_linux_"
+FILE_SUFFIX="_x64"
 
 # GitHubのリポジトリURLベース
 GITHUB_RELEASES_URL="https://github.com/rigaya/Amatsukaze/releases/download"
@@ -82,7 +83,7 @@ fi
 VERSION="$1"
 # 第2引数が指定されていればそれを、なければデフォルト値を使用する
 DOWNLOAD_DIR="${2:-$DEFAULT_DOWNLOAD_DIR}"
-FILENAME="${FILE_PREFIX}${VERSION}.tar.xz"
+FILENAME="${FILE_PREFIX}${VERSION}${FILE_SUFFIX}.tar.xz"
 DOWNLOAD_URL="${GITHUB_RELEASES_URL}/${VERSION}/${FILENAME}"
 
 # スクリプトが配置されているディレクトリを取得し、カレントディレクトリにする
