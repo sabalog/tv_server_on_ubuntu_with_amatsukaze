@@ -286,6 +286,22 @@ if ! tar -xf "$DOWNLOAD_PATH" -C "$TARGET_DIR"; then
     exit 1
 fi
 
+# 同梱の libstdc++.so.6 を退避する。
+#
+# 同梱版は古く、システム側 (KTGMC.so 等が要求する GLIBCXX_3.4.29 以降) より
+# 優先して読み込まれると AviSynth プラグインのロードに失敗するため、
+# 展開のたびに .bak へ退避してシステム側のライブラリを使わせる。
+# 展開で毎回元のファイルが復活するので、更新ごとにこの処理が必要になる。
+BUNDLED_LIBSTDCXX="${TARGET_DIR}/exe_files/lib/libstdc++.so.6"
+if [ -e "$BUNDLED_LIBSTDCXX" ] || [ -L "$BUNDLED_LIBSTDCXX" ]; then
+    # 前回の .bak が残っていても上書きできるよう -f を付ける
+    mv -f "$BUNDLED_LIBSTDCXX" "${BUNDLED_LIBSTDCXX}.bak" \
+        || die "libstdc++.so.6 を退避できません: ${BUNDLED_LIBSTDCXX}"
+    echo "同梱の libstdc++.so.6 を libstdc++.so.6.bak に退避しました。"
+else
+    echo "同梱の libstdc++.so.6 は見つからないため、退避をスキップします。"
+fi
+
 # 展開先に移動
 cd "$TARGET_DIR" || die "展開先ディレクトリへ移動できません: ${TARGET_DIR}"
 
