@@ -149,6 +149,26 @@ def delete_existing_converted_files(target_dir, file_stem):
             except Exception as e:
                 print(f"  -> Delete Error ({f.name}): {e}")
 
+def delete_files_by_partial_match(target_dir, file_stem):
+    """
+    target_dir (CONVERTED_BASE) 以下の全階層から、
+    file_stem がファイル名に部分一致するファイルを拡張子問わず削除する。
+    """
+    if not target_dir.exists():
+        return
+
+    # rglob("*") で target_dir 以下のすべてのファイルを再帰的に検索
+    for f in target_dir.rglob("*"):
+        if f.is_file() and file_stem in f.name:
+            if DRY_RUN_MODE:
+                print(f"  [DryRun] Would delete (Partial match): {f.name} (at {f.parent})")
+            else:
+                try:
+                    f.unlink()
+                    print(f"  -> Deleted (Partial match): {f.name} (at {f.parent})")
+                except Exception as e:
+                    print(f"  -> Delete Error ({f.name}): {e}")
+
 def convert_single_file(input_file_path, cli_path, server_ip, profile):
     try:
         input_path = input_file_path
@@ -315,6 +335,10 @@ def main():
         with lock:
             for idx in selected_indices:
                 target_file = candidates[idx]["path"]
+                
+                print(f"\n[Cleanup] 過去の変換ファイルを部分一致で検索・削除します: {target_file.stem}")
+                delete_files_by_partial_match(CONVERTED_BASE, target_file.stem)
+                
                 convert_single_file(target_file, DEFAULT_CLI_PATH, DEFAULT_SERVER_IP, DEFAULT_PROFILE)
     except KeyboardInterrupt:
         print("\n中止しました。")
