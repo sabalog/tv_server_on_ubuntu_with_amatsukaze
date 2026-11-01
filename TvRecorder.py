@@ -226,14 +226,14 @@ class Config:
     nas_exclude_dirs: List[str] = field(default_factory=lambda: ['/keep/', '/delete_after_watch/'])
 
     # --- 容量上限設定 (GB) ---
-    max_size_hdd_gb: float = 4500.0
+    max_size_hdd_gb: float = 3600.0
     max_size_converted_gb: float = 150.0
     max_size_nas_gb: float = 4000.0
 
     # --- 保持ポリシー ---
     retention_policies_hdd: List[Dict] = field(default_factory=lambda: [
         {"dir": "delete_after_watch", "days": 365, "limit_gb": 1500},
-        {"dir": "delete", "days": 182, "limit_gb": 3000}
+        {"dir": "delete", "days": 120, "limit_gb": 2000}
     ])
     retention_policies_nas: List[Dict] = field(default_factory=lambda: [
         {"dir": "delete", "days": 365, "limit_gb": 2000},
